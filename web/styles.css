@@ -1165,6 +1165,13 @@ a:hover {
   border-radius: 7px;
 }
 
+.research-actions,
+.job-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+
 .research-report {
   margin-top: 11px;
   border-top: 1px solid var(--border);

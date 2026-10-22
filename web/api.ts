@@ -130,6 +130,11 @@ export const api = {
       }>;
       sources: SourcePartData[];
     }>(`/api/research/${encodeURIComponent(jobID)}`),
+
+  resumeResearch: (jobID: string) =>
+    request<{ message: Message }>(`/api/research/${encodeURIComponent(jobID)}/resume`, {
+      method: "POST",
+    }),
 };
 
 /** The research part card needs this narrow helper for dashboard labels. */

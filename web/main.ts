@@ -353,6 +353,25 @@ async function stopRun(): Promise<void> {
   }
 }
 
+async function resumeResearch(jobID: string): Promise<void> {
+  if (!state.detail?.session) {
+    showToast("info", "Open the research session first.");
+    return;
+  }
+  try {
+    await api.resumeResearch(jobID);
+    state.running = true;
+    state.status = "streaming";
+    renderHeader();
+    renderComposer();
+    showToast("info", "Resuming from the saved checkpoint…");
+    await reloadCurrent();
+    if (!state.connected) startPolling();
+  } catch (err) {
+    showToast("error", `Could not resume: ${(err as Error).message}`);
+  }
+}
+
 async function changeModel(): Promise<void> {
   const ref = els.modelSelect.value;
   if (!ref || !state.detail) return;
@@ -861,7 +880,10 @@ async function openDashboard(): Promise<void> {
     try {
       const payload = await api.researchJob(job.id);
       if (selectedID !== job.id) return;
-      renderJobDetail(detail, payload, session.id);
+      renderJobDetail(detail, payload, session.id, () => {
+        modal.close();
+        void resumeResearch(job.id);
+      });
     } catch (err) {
       if (selectedID !== job.id) return;
       detail.replaceChildren(el("p", { class: "error-text", text: (err as Error).message }));
@@ -895,6 +917,7 @@ function renderJobDetail(
   root: HTMLElement,
   payload: Awaited<ReturnType<typeof api.researchJob>>,
   sessionID: string,
+  onResume?: () => void,
 ): void {
   const { job, notes, sources } = payload;
   clear(root);
@@ -909,6 +932,15 @@ function renderJobDetail(
   chips.append(el("span", { class: "chip", text: `${sources.length} sources` }));
   head.append(chips);
   root.append(head);
+
+  if (job.status !== "done" && job.plan && onResume) {
+    const actions = el("div", { class: "job-actions" });
+    const button = el("button", { class: "button button-small", type: "button" });
+    button.append(icon("clock", 14), document.createTextNode("Resume from saved work"));
+    button.addEventListener("click", onResume);
+    actions.append(button);
+    root.append(actions);
+  }
 
   if (job.plan) {
     const plan = el("section", { class: "job-section" });
@@ -1056,6 +1088,11 @@ function bindEvents(): void {
     if (answer?.dataset.answerQuestion) {
       const part = findQuestionPart(answer.dataset.answerQuestion);
       if (part && state.detail) showQuestion(part, state.detail.session.id);
+      return;
+    }
+    const resume = target.closest<HTMLElement>("[data-resume-job]");
+    if (resume?.dataset.resumeJob) {
+      void resumeResearch(resume.dataset.resumeJob);
       return;
     }
     const suggestion = target.closest<HTMLElement>("[data-prompt]");

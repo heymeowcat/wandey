@@ -257,6 +257,18 @@ function renderResearchPart(id: string, data: ResearchPartData): HTMLElement {
 
   if (data.error) card.append(el("div", { class: "research-error", text: data.error }));
 
+  if (data.status === "error" && data.jobID) {
+    const actions = el("div", { class: "research-actions" });
+    const button = el("button", {
+      class: "button button-small",
+      type: "button",
+      dataset: { resumeJob: data.jobID },
+    });
+    button.append(icon("clock", 14), document.createTextNode("Resume from saved work"));
+    actions.append(button);
+    card.append(actions);
+  }
+
   if (data.report) {
     const details = el("details", { class: "research-report" });
     details.append(el("summary", { text: `Full report · ${formatNumber(data.report.length)} chars` }));
