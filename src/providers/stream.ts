@@ -31,19 +31,39 @@ export function joinURL(base: string, path: string): string {
   return `${cleanBase}${cleanPath}`;
 }
 
-/** Parse an SSE byte stream into messages. Handles CRLF and multi-line data. */
+/**
+ * Parse an SSE byte stream into messages. Handles CRLF and multi-line data.
+ *
+ * `idleTimeoutMs` guards against streams that connect and then go silent. The
+ * read is cancelled rather than left dangling, so an abandoned model request
+ * cannot keep a session "running" forever.
+ */
 export async function* parseSSE(
   stream: ReadableStream<Uint8Array>,
   label = "stream",
+  options: { idleTimeoutMs?: number } = {},
 ): AsyncGenerator<SSEMessage, void, unknown> {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let timedOut = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  const arm = () => {
+    if (!options.idleTimeoutMs) return;
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => {
+      timedOut = true;
+      void reader.cancel().catch(() => {});
+    }, options.idleTimeoutMs);
+  };
 
   try {
+    arm();
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
+      arm();
       buffer += decoder.decode(value, { stream: true });
 
       while (true) {
@@ -55,6 +75,9 @@ export async function* parseSSE(
         if (message) yield message;
       }
     }
+    if (timedOut) {
+      throw new ProviderError(`${label} stalled for ${Math.round((options.idleTimeoutMs ?? 0) / 1000)}s with no data`);
+    }
     buffer += decoder.decode();
     if (buffer.trim()) {
       const message = parseBlock(buffer);
@@ -65,6 +88,7 @@ export async function* parseSSE(
     if ((err as Error)?.name === "AbortError") return;
     throw new ProviderError(`${label} failed while reading: ${(err as Error).message}`, { cause: err });
   } finally {
+    if (timer) clearTimeout(timer);
     reader.releaseLock();
   }
 }

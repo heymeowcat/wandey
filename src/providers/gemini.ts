@@ -112,7 +112,7 @@ export class GeminiProvider implements ProviderAdapter {
     let sawToolCall = false;
     let callCounter = 0;
 
-    for await (const message of parseSSE(stream, `${this.id} stream`)) {
+    for await (const message of parseSSE(stream, `${this.id} stream`, { idleTimeoutMs: 120_000 })) {
       if (!message.data || message.data === "[DONE]") continue;
       let json: unknown;
       try {

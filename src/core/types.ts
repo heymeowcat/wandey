@@ -225,6 +225,7 @@ export interface QuestionPartData {
   multiple: boolean;
   allowCustom: boolean;
   answer?: string[];
+  custom?: string;
   /** How the question ended, in case it was never answered. */
   status?: "pending" | "answered" | "expired";
 }
