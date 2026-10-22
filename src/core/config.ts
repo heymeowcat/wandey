@@ -41,8 +41,7 @@ export type SearchProviderConfig =
   | { type: "exa"; apiKey?: string; apiKeyEnv?: string; enabled?: boolean }
   | { type: "duckduckgo"; enabled?: boolean }
   | { type: "bing"; enabled?: boolean }
-  | { type: "wikipedia"; enabled?: boolean }
-  | { type: "github"; token?: string; tokenEnv?: string; enabled?: boolean };
+  | { type: "wikipedia"; enabled?: boolean };
 
 export interface CrawlConfig {
   concurrency: number;
@@ -65,11 +64,9 @@ export interface CrawlConfig {
   pdf: { enabled: boolean; command: string };
   /** Optional JS renderer. "none" keeps wandey dependency-free. */
   render: {
-    backend: "none" | "cdp" | "firecrawl" | "crawl4ai" | "reader";
+    backend: "none" | "firecrawl" | "crawl4ai" | "reader";
     endpoint: string;
     apiKey: string;
-    /** e.g. http://127.0.0.1:9222 for a running Chrome. */
-    chromeUrl: string;
   };
 }
 
@@ -101,8 +98,6 @@ export interface Config {
     model: string;
     maxSteps: number;
     temperature: number;
-    /** Ask before running tools that can change the machine. Web tools are free. */
-    approval: "auto" | "ask";
     /** Rough character budget before old turns are compacted. */
     contextChars: number;
     autoTitle: boolean;
@@ -120,9 +115,6 @@ export interface Config {
   };
   crawl: CrawlConfig;
   research: ResearchConfig;
-  ui: {
-    theme: "dark" | "light" | "system";
-  };
   storage: {
     dir: string;
   };
@@ -150,7 +142,6 @@ export const DEFAULTS: Config = {
     model: "",
     maxSteps: 24,
     temperature: 0.4,
-    approval: "auto",
     contextChars: 220_000,
     autoTitle: true,
     systemExtra: "",
@@ -187,19 +178,18 @@ export const DEFAULTS: Config = {
     timeoutMs: 20_000,
     maxContentBytes: 6 * 1024 * 1024,
     maxCharsPerPage: 80_000,
-    maxPagesPerCall: 200,
-    maxDepth: 3,
+    maxPagesPerCall: 12,
+    maxDepth: 1,
     respectRobots: true,
     useSitemaps: true,
     readerFallback: true,
     readerEndpoint: "https://r.jina.ai",
-    userAgent: "wandey/0.1 (research agent; +https://github.com/wandey/wandey)",
+    userAgent: "wandey/0.1 (research agent)",
     pdf: { enabled: true, command: "pdftotext" },
     render: {
       backend: "none",
       endpoint: "",
       apiKey: "",
-      chromeUrl: "http://127.0.0.1:9222",
     },
   },
   research: {
@@ -210,13 +200,12 @@ export const DEFAULTS: Config = {
     pagesPerSubQuestion: 6,
     maxSources: 60,
     workers: 3,
-    outputDir: "./research",
+    outputDir: "",
     maxReportChars: 50_000,
     planModel: "",
     workerModel: "",
     synthModel: "",
   },
-  ui: { theme: "system" },
   storage: { dir: "~/.wandey" },
 };
 
@@ -255,13 +244,18 @@ export function loadConfig(env: Record<string, string | undefined> = Bun.env): L
   }
 
   const config = mergeConfig(DEFAULTS, raw);
-  config.storage.dir = config.storage.dir
-    ? path.resolve(expandHome(config.storage.dir))
-    : paths.home;
+  // An explicit config wins. Otherwise WANDEY_HOME is the storage root, which
+  // makes throwaway instances and tests genuinely isolated. The final fallback
+  // is the normal ~/.wandey home.
+  const storageDir = raw.storage?.dir?.trim() || env.WANDEY_HOME?.trim() || DEFAULTS.storage.dir;
+  config.storage.dir = path.resolve(expandHome(storageDir));
   // The storage dir owns runtime data even when the config lives in a repo.
   paths.home = config.storage.dir;
   paths.dbFile = path.join(paths.home, "wandey.db");
   paths.cacheDir = path.join(paths.home, "cache");
+  if (!config.research.outputDir.trim()) {
+    config.research.outputDir = path.join(paths.home, "research");
+  }
 
   applyPortEnv(config, env);
   applyEnvProviders(config, env);
@@ -290,7 +284,6 @@ export function mergeConfig(base: Config, patch: Partial<Config>): Config {
       render: { ...clone.crawl.render, ...(patch.crawl?.render ?? {}) },
     },
     research: { ...clone.research, ...(patch.research ?? {}) },
-    ui: { ...clone.ui, ...(patch.ui ?? {}) },
     storage: { ...clone.storage, ...(patch.storage ?? {}) },
   };
   return next;
@@ -418,7 +411,6 @@ export function redactConfig(config: Config): Config {
   }
   for (const search of clean.search.providers) {
     if ("apiKey" in search && search.apiKey) search.apiKey = "•••";
-    if ("token" in search && search.token) search.token = "•••";
   }
   clean.crawl.render.apiKey = clean.crawl.render.apiKey ? "•••" : "";
   return clean;
@@ -444,7 +436,6 @@ export function saveConfig(patch: Partial<Config>, paths: Paths): Config {
     search: merged.search,
     crawl: merged.crawl,
     research: merged.research,
-    ui: merged.ui,
     storage: merged.storage,
   };
   fs.mkdirSync(path.dirname(paths.configFile), { recursive: true });

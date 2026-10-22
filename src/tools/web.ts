@@ -106,12 +106,12 @@ export const crawlSiteTool: Tool = {
     properties: {
       url: { type: "string", description: "Seed URL." },
       urls: { type: "array", items: { type: "string" }, description: "Multiple seed URLs." },
-      max_pages: { type: "integer", description: "Page budget, 1-2000. Default 12." },
-      max_depth: { type: "integer", description: "Link depth from the seeds, 0-8. Default 1." },
+      max_pages: { type: "integer", description: "Page budget, 1-2000. Defaults to crawl.maxPagesPerCall (12 out of the box)." },
+      max_depth: { type: "integer", description: "Link depth from the seeds, 0-8. Defaults to crawl.maxDepth (1 out of the box)." },
       same_domain: { type: "boolean", description: "Stay on the seed sites. Default true." },
       include_paths: { type: "array", items: { type: "string" }, description: "Only follow URL paths matching these prefixes/globs, e.g. /docs/*." },
       exclude_paths: { type: "array", items: { type: "string" }, description: "Skip URL paths matching these prefixes/globs." },
-      include_sitemaps: { type: "boolean", description: "Also seed from sitemap.xml. Default false." },
+      include_sitemaps: { type: "boolean", description: "Also seed from sitemap.xml. Defaults to crawl.useSitemaps (true out of the box)." },
       time_budget_seconds: { type: "integer", description: "Hard time budget, 10-600 seconds. Default 60." },
     },
   },
@@ -123,12 +123,12 @@ export const crawlSiteTool: Tool = {
     ])];
     if (seeds.length === 0) throw new Error('Provide "url" or "urls"');
 
-    const maxPages = Math.min(Math.max(optionalNumber(args, "max_pages") ?? 12, 1), 2000);
-    const maxDepth = Math.min(Math.max(optionalNumber(args, "max_depth") ?? 1, 0), 8);
+    const maxPages = Math.min(Math.max(optionalNumber(args, "max_pages") ?? ctx.config.crawl.maxPagesPerCall, 1), 2000);
+    const maxDepth = Math.min(Math.max(optionalNumber(args, "max_depth") ?? ctx.config.crawl.maxDepth, 0), 8);
     const sameDomain = optionalBoolean(args, "same_domain") ?? true;
     const includePaths = optionalStringArray(args, "include_paths");
     const excludePaths = optionalStringArray(args, "exclude_paths");
-    const includeSitemaps = optionalBoolean(args, "include_sitemaps") ?? false;
+    const includeSitemaps = optionalBoolean(args, "include_sitemaps") ?? ctx.config.crawl.useSitemaps;
     const timeBudget = Math.min(Math.max(optionalNumber(args, "time_budget_seconds") ?? 60, 10), 600) * 1000;
 
     const crawler = new Crawler(ctx.fetcher, ctx.config.crawl);
