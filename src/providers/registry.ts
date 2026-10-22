@@ -109,6 +109,7 @@ export class ProviderRegistry {
           headers: cfg.headers,
           models: cfg.models,
           local: isLocal,
+          ollama: id === "ollama" || baseUrl.includes(":11434"),
         });
       }
 

@@ -25,6 +25,8 @@ export interface OpenAIProviderOptions {
   headers?: Record<string, string>;
   models?: string[];
   local?: boolean;
+  /** Discover local and cloud models from Ollama's native catalog. */
+  ollama?: boolean;
 }
 
 export class OpenAIProvider implements ProviderAdapter {
@@ -94,6 +96,16 @@ export class OpenAIProvider implements ProviderAdapter {
       // Endpoint doesn't implement /models (or is offline). Extra models still work.
     }
 
+    if (this.options.ollama) {
+      const discovered = await this.listOllamaCatalog();
+      const ids = new Set(fetched.map((model) => model.id));
+      for (const model of discovered) {
+        if (ids.has(model.id)) continue;
+        ids.add(model.id);
+        fetched.push(model);
+      }
+    }
+
     const known = new Set(fetched.map((model) => model.id));
     for (const id of extra) {
       if (known.has(id)) continue;
@@ -106,6 +118,61 @@ export class OpenAIProvider implements ProviderAdapter {
       });
     }
     return fetched;
+  }
+
+  /**
+   * Ollama's OpenAI-compatible /models endpoint only lists downloaded local
+   * models. Its native tag endpoint also knows cloud models, which a signed-in
+   * local Ollama can run. Add those to the picker so users do not have to
+   * remember that e.g. minimax-m3.1-flash:cloud exists.
+   */
+  private async listOllamaCatalog(): Promise<ModelInfo[]> {
+    const origin = new URL(this.baseUrl).origin;
+    let localTags: unknown;
+    try {
+      localTags = await fetchJSON<unknown>(
+        `${origin}/api/tags`,
+        { headers: this.headers() },
+        { provider: this.options.id, timeoutMs: 6000 },
+      );
+    } catch {
+      // No local Ollama server: do not advertise cloud models that cannot be reached.
+      return [];
+    }
+
+    const cloudTags = await fetchJSON<unknown>(
+      "https://ollama.com/api/tags",
+      {},
+      { provider: `${this.options.id} cloud`, timeoutMs: 5000 },
+    ).catch(() => null);
+
+    const models = new Map<string, ModelInfo>();
+    const add = (row: unknown, isCloud: boolean) => {
+      const record = asRecord(row);
+      const raw = asString(record.name) || asString(record.model);
+      if (!raw) return;
+      const id = isCloud ? ollamaCloudID(raw) : raw;
+      const capabilities = asArray(record.capabilities).map((value) => asString(value));
+      const model: ModelInfo = {
+        id,
+        name: id,
+        provider: this.options.id,
+        ref: `${this.options.id}/${id}`,
+      };
+      if (capabilities.length > 0) {
+        model.supportsTools = capabilities.includes("tools");
+        model.supportsReasoning = capabilities.includes("thinking");
+        model.supportsVision = capabilities.includes("vision");
+      }
+      if (isCloud && isFreeOllamaCloud(id)) model.free = true;
+      models.set(id, model);
+    };
+
+    for (const row of asArray(asRecord(localTags).models)) add(row, false);
+    if (cloudTags !== null) {
+      for (const row of asArray(asRecord(cloudTags).models)) add(row, true);
+    }
+    return [...models.values()];
   }
 
   async *stream(req: ChatRequest): AsyncGenerator<ProviderEvent, void, unknown> {
@@ -210,6 +277,27 @@ export class OpenAIProvider implements ProviderAdapter {
 
     yield { type: "finish", reason: finishReason };
   }
+}
+
+export function ollamaCloudID(name: string): string {
+  if (name.endsWith("-cloud") || name.endsWith(":cloud")) return name;
+  const colon = name.indexOf(":");
+  if (colon === -1) return `${name}:cloud`;
+  const base = name.slice(0, colon);
+  const tag = name.slice(colon + 1);
+  // Ollama uses size-suffixed cloud tags such as gpt-oss:20b-cloud. Digest-like
+  // variant tags (e.g. :1017) are just catalog builds; use the family name.
+  if (/^\d+[bB]$/.test(tag)) return `${base}:${tag}-cloud`;
+  return `${base}:cloud`;
+}
+
+function isFreeOllamaCloud(id: string): boolean {
+  if (id === "beam:cloud") return true;
+  // Ollama's M3.1 Flash launch promotion runs through 2026-10-22 23:59 UTC.
+  if (id === "minimax-m3.1-flash:cloud" && Date.now() < Date.parse("2026-10-23T00:00:00Z")) {
+    return true;
+  }
+  return false;
 }
 
 export function toOpenAIMessages(system: string | undefined, messages: ChatMessage[]): unknown[] {
