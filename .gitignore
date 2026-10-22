@@ -1,7 +1,7 @@
 node_modules/
 dist/
 web/dist/
-research/
+/research/
 .wandey/
 *.log
 .DS_Store
