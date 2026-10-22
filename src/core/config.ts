@@ -40,6 +40,7 @@ export type SearchProviderConfig =
   | { type: "tavily"; apiKey?: string; apiKeyEnv?: string; enabled?: boolean }
   | { type: "exa"; apiKey?: string; apiKeyEnv?: string; enabled?: boolean }
   | { type: "duckduckgo"; enabled?: boolean }
+  | { type: "bing"; enabled?: boolean }
   | { type: "wikipedia"; enabled?: boolean }
   | { type: "github"; token?: string; tokenEnv?: string; enabled?: boolean };
 
@@ -174,7 +175,7 @@ export const DEFAULTS: Config = {
   },
   search: {
     providers: [
-      { type: "duckduckgo" },
+      { type: "bing" },
       { type: "wikipedia" },
     ],
     maxResults: 10,
@@ -349,7 +350,7 @@ function applyEnvSearch(config: Config, env: Record<string, string | undefined>)
   const exa = firstEnvFrom(["EXA_API_KEY"], env);
   if (exa) auto.push({ type: "exa", apiKeyEnv: exa.name });
   if (auto.length > 0) {
-    config.search.providers = [...auto, ...config.search.providers.filter((p) => p.type === "duckduckgo" || p.type === "wikipedia")];
+    config.search.providers = [...auto, ...config.search.providers.filter((p) => p.type === "bing" || p.type === "duckduckgo" || p.type === "wikipedia")];
   }
 }
 

@@ -298,6 +298,8 @@ export interface ResearchSource {
 
 export interface EvidenceNote {
   id: string;
+  sessionID: string;
+  jobID: string;
   claim: string;
   quote: string;
   sourceID: string;

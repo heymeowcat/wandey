@@ -37,7 +37,7 @@ export class Store {
   }
 
   private migrate(): void {
-    const current = Number(this.db.query("pragma user_version").get()?.user_version ?? 0);
+    const current = Number((this.db.query("pragma user_version").get() as { user_version?: number } | null)?.user_version ?? 0);
     for (let version = current; version < MIGRATIONS.length; version++) {
       const sql = MIGRATIONS[version]!;
       this.db.transaction(() => {
@@ -579,7 +579,7 @@ function rowToNote(row: NoteRow): EvidenceNote {
     subQuestionID: row.sub_question_id,
     confidence: row.confidence as EvidenceNote["confidence"],
     round: row.round,
-  } as EvidenceNote & { sessionID: string; jobID: string };
+  };
 }
 
 function canonicalKey(url: string): string {
