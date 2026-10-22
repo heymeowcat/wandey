@@ -167,6 +167,11 @@ the provider automatically; the key stays in memory and is not written to the co
 Local servers do not need a key. Wandey probes them at startup and ignores dead ports.
 They are OpenAI-compatible, so any other local server can be added with a custom provider.
 
+If Ollama is signed in (`ollama signin`), Wandey also discovers Ollama's cloud models and
+lists them under the same provider, for example `minimax-m3.1-flash:cloud` or
+`gpt-oss:120b-cloud`. Free models currently advertised by Ollama's catalog are labeled
+`free` in the picker.
+
 ### Custom providers
 
 Add any OpenAI-, Anthropic-, or Gemini-compatible endpoint under `providers`:
