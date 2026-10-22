@@ -17,6 +17,7 @@ import type {
   Usage,
 } from "../core/types.ts";
 import { newID, now } from "../core/util.ts";
+import { canonicalURL as canonicalKey } from "../core/url.ts";
 import { MIGRATIONS } from "./schema.ts";
 
 /**
@@ -580,22 +581,6 @@ function rowToNote(row: NoteRow): EvidenceNote {
     confidence: row.confidence as EvidenceNote["confidence"],
     round: row.round,
   };
-}
-
-function canonicalKey(url: string): string {
-  try {
-    const parsed = new URL(url);
-    parsed.hash = "";
-    // Strip common tracking params so the same page is cached once.
-    for (const key of [...parsed.searchParams.keys()]) {
-      if (/^(utm_|fbclid|gclid|ref|ref_src|source)$/i.test(key)) parsed.searchParams.delete(key);
-    }
-    parsed.hostname = parsed.hostname.toLowerCase().replace(/^www\./, "");
-    if (parsed.pathname !== "/") parsed.pathname = parsed.pathname.replace(/\/+$/, "");
-    return parsed.toString();
-  } catch {
-    return url;
-  }
 }
 
 function safeSite(url: string): string {

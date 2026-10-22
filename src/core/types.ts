@@ -362,6 +362,11 @@ export interface FetchedPage {
   via: "http" | "reader" | "browser" | "backend" | "cache";
   fromCache?: boolean;
   error?: string;
+  headings?: string[];
+  excerpt?: string;
+  byline?: string;
+  publishedAt?: string;
+  isProbablyJSApp?: boolean;
 }
 
 // ---------------------------------------------------------------------------
