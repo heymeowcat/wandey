@@ -7,6 +7,7 @@ import type {
   Part,
   ProviderEvent,
   QuestionPartData,
+  ResearchDepth,
   Session,
   SourcePartData,
   ToolCallBlock,
@@ -17,7 +18,8 @@ import type { ProviderRegistry } from "../providers/registry.ts";
 import type { Store } from "../storage/store.ts";
 import type { PageFetcher } from "../crawl/fetcher.ts";
 import type { SearchService } from "../search/search.ts";
-import type { AskRequest, AskResponse, ToolContext, ToolRegistry } from "../tools/types.ts";
+import type { AskRequest, AskResponse, DeepResearchOptions, ToolContext, ToolRegistry, ToolResult } from "../tools/types.ts";
+import { ResearchEngine } from "../research/engine.ts";
 import { buildProviderHistory } from "./history.ts";
 import { buildSystemPrompt } from "./prompt.ts";
 
@@ -58,8 +60,11 @@ const DEFAULT_TITLES = new Set(["New research", "New chat", "Untitled"]);
 export class Agent {
   private runs = new Map<string, RunState>();
   private questions = new Map<string, PendingQuestion>();
+  private readonly research: ResearchEngine;
 
-  constructor(private readonly deps: AgentDeps) {}
+  constructor(private readonly deps: AgentDeps) {
+    this.research = new ResearchEngine(deps);
+  }
 
   isRunning(sessionID: string): boolean {
     return this.runs.has(sessionID);
@@ -388,6 +393,8 @@ export class Agent {
       search: this.deps.search,
       registry: this.deps.registry,
       ask: (request) => this.askUser(sessionID, messageID, request, controller),
+      deepResearch: (question, depth, options) =>
+        this.runDeepResearch(sessionID, question, depth, options),
     };
 
     const result = await tools.execute(call.name, call.args, context);
@@ -413,6 +420,49 @@ export class Agent {
         bus.publish({ type: "part.created", sessionID, messageID, part });
       }
     }
+  }
+
+  private async runDeepResearch(
+    sessionID: string,
+    question: string,
+    depth: ResearchDepth | undefined,
+    options: DeepResearchOptions,
+  ): Promise<ToolResult> {
+    const session = this.deps.store.getSession(sessionID);
+    const outcome = await this.research.run({
+      sessionID,
+      messageID: options.messageID,
+      question,
+      depth,
+      model: session?.model ?? this.deps.config.agent.model,
+      signal: options.signal,
+    });
+
+    const header = [
+      `Deep research complete: ${outcome.sources.length} sources, ${outcome.notes} evidence notes, ${outcome.cited.length} cited.`,
+      `Report file: ${outcome.outputPath}`,
+      outcome.warnings.length > 0 ? `Warnings: ${outcome.warnings.slice(0, 6).join("; ")}` : "",
+      "",
+      "Use the report below to answer the user. Cite its [sN] ids; they match the source cards in this session.",
+      "",
+    ].filter(Boolean).join("\n");
+
+    return {
+      title: `Researched: ${truncate(question, 64)}`,
+      output: truncate(`${header}${outcome.report}`, 48_000),
+      metadata: {
+        jobID: outcome.job.id,
+        outputPath: outcome.outputPath,
+        sources: outcome.sources.map((source) => ({
+          sourceID: source.sourceID,
+          title: source.title,
+          url: source.url,
+        })),
+        cited: outcome.cited,
+        notes: outcome.notes,
+        warnings: outcome.warnings,
+      },
+    };
   }
 
   private askUser(

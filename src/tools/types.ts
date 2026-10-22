@@ -1,6 +1,6 @@
 import type { Config } from "../core/config.ts";
 import type { Emit } from "../core/events.ts";
-import type { JsonSchema, QuestionOption, SourcePartData, ToolSchema } from "../core/types.ts";
+import type { JsonSchema, QuestionOption, ResearchDepth, SourcePartData, ToolSchema } from "../core/types.ts";
 import type { ProviderRegistry } from "../providers/registry.ts";
 import type { Store } from "../storage/store.ts";
 import type { PageFetcher } from "../crawl/fetcher.ts";
@@ -21,6 +21,18 @@ export interface AskResponse {
 
 export type AskHandler = (request: AskRequest) => Promise<AskResponse>;
 
+export interface DeepResearchOptions {
+  messageID: string;
+  callID: string;
+  signal: AbortSignal;
+}
+
+export type DeepResearchHandler = (
+  question: string,
+  depth: ResearchDepth | undefined,
+  options: DeepResearchOptions,
+) => Promise<ToolResult>;
+
 /** Everything a tool is allowed to touch. */
 export interface ToolContext {
   sessionID: string;
@@ -35,8 +47,8 @@ export interface ToolContext {
   search: SearchService;
   registry: ProviderRegistry;
   ask: AskHandler;
-  /** Injected after the research engine is constructed (avoids an import cycle). */
-  deepResearch?: (question: string, depth: "quick" | "standard" | "deep" | "exhaustive") => Promise<ToolResult>;
+  /** Injected by the agent; keeps the tool package free of research-engine imports. */
+  deepResearch?: DeepResearchHandler;
 }
 
 export interface ToolResult {
