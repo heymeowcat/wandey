@@ -1,7 +1,7 @@
 {
   "name": "wandey",
-  "version": "0.0.1",
-  "description": "A debloated, unlimited research agent. Bring your own models, crawl the web without limits.",
+  "version": "0.1.0",
+  "description": "A debloated, provider-agnostic research agent. Bring your own models and configure your own crawl budgets.",
   "type": "module",
   "private": true,
   "bin": {
