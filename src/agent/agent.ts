@@ -93,7 +93,10 @@ export class Agent {
     if (part) this.deps.bus.publish({ type: "part.created", sessionID, messageID: user.id, part });
 
     let updated = session;
-    if (DEFAULT_TITLES.has(session.title) || !session.title.trim()) {
+    if (
+      this.deps.config.agent.autoTitle &&
+      (DEFAULT_TITLES.has(session.title) || !session.title.trim())
+    ) {
       updated = this.deps.store.updateSession(sessionID, { title: truncate(prompt.replace(/\s+/g, " "), 72) }) ?? session;
     }
     if (options.mode && options.mode !== updated.mode) {
@@ -329,10 +332,10 @@ export class Agent {
       if (!controller.signal.aborted) {
         this.fail(sessionID, (err as Error).message);
       }
-    } finally {
-      bus.publish({ type: "session.status", sessionID, status: "idle" });
-      bus.publish({ type: "session.updated", session: store.getSession(sessionID) ?? session });
     }
+    // No lifecycle events here. The outer finalizer in prompt() is the single
+    // place that touches the session and publishes `idle`. Emitting idle first
+    // would let a CLI close storage while finalization is still running.
   }
 
   private consumeEvent(
