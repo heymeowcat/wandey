@@ -1,0 +1,34 @@
+{
+  "name": "wandey",
+  "version": "0.0.1",
+  "description": "A debloated, unlimited research agent. Bring your own models, crawl the web without limits.",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "wandey": "./bin/wandey"
+  },
+  "scripts": {
+    "dev": "bun run src/cli/index.ts serve",
+    "start": "bun run src/cli/index.ts serve",
+    "chat": "bun run src/cli/index.ts chat",
+    "build:web": "bun run scripts/build-web.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@mozilla/readability": "^0.6.0",
+    "highlight.js": "^11.11.1",
+    "linkedom": "^0.18.9",
+    "markdown-it": "^14.1.0",
+    "turndown": "^7.2.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/markdown-it": "^14.1.2",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "bun": ">=1.1.0"
+  },
+  "license": "MIT"
+}
