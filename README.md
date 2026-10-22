@@ -375,6 +375,30 @@ If planning or synthesis fails, the engine falls back to a deterministic report 
 from the evidence notes rather than discarding the run. Aborting leaves the job marked
 `aborted` and retains partial notes.
 
+### Stop and resume
+
+A research job is not just an in-memory loop. After planning, each search result, page read,
+extraction, and gap round is checkpointed to the database. **Stop** cancels in-flight searches,
+reads, and model calls; workers are allowed to settle before the job is marked aborted so
+nothing writes progress after cancellation.
+
+Use **Resume from saved work** on an aborted research card or in the research dashboard.
+Resuming creates a new assistant message and continues the same job from its checkpoint:
+
+- completed sub-questions are skipped;
+- pages already read are not fetched again;
+- evidence notes are reused rather than duplicated;
+- the remaining gap rounds and synthesis run normally.
+
+Jobs that were interrupted by a server restart are marked resumable on the next boot. Jobs
+created before checkpointing existed still recover their saved plan, notes, and sources and
+synthesize a report from that evidence, warning that unfinished follow-up questions were not
+re-run.
+
+Checkpoints live in the `research_job.state` column and include the plan, question rounds,
+candidate URLs, page-to-source mappings, completed questions, warnings, and progress. Note
+text and page bodies remain in their own tables, so a checkpoint stays small.
+
 ### Research settings
 
 | Key | Default | Meaning |
@@ -602,6 +626,7 @@ network.
 | `GET` | `/api/sessions/:id/research` | List research jobs for a session. |
 | `GET` | `/api/sessions/:id/sources/:sourceID` | Full saved source content. |
 | `GET` | `/api/research/:jobID` | Job, notes, and sources. |
+| `POST` | `/api/research/:jobID/resume` | Resume an aborted or interrupted job. |
 | `GET` | `/ws` | WebSocket for session events. |
 
 The WebSocket sends a `hello` event and then streams `session.updated`, `message.created`,
