@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="theme-color" content="#0d0f14" />
+    <title>wandey</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div id="app" class="app">
+      <aside id="sidebar" class="sidebar">
+        <div class="brand-row">
+          <div class="brand">
+            <span class="brand-mark" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                <path d="m12 3 1.7 5.3L19 10l-5.3 1.7L12 17l-1.7-5.3L5 10l5.3-1.7L12 3Z" />
+                <path d="M19 16l.8 2.2L22 19l-2.2.8L19 22l-.8-2.2L16 19l2.2-.8L19 16Z" />
+              </svg>
+            </span>
+            <span class="brand-text">
+              <span class="brand-name">wandey</span>
+              <span class="brand-tag">research agent</span>
+            </span>
+          </div>
+        </div>
+
+        <button id="new-session" class="new-session" type="button">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" aria-hidden="true">
+            <path d="M12 5v14M5 12h14" />
+          </svg>
+          <span>New research</span>
+          <kbd>⌘K</kbd>
+        </button>
+
+        <div class="sidebar-label">Sessions</div>
+        <nav id="session-list" class="session-list" aria-label="Sessions"></nav>
+
+        <div class="sidebar-footer">
+          <div id="provider-summary" class="provider-summary"></div>
+          <button id="dashboard-button" class="dashboard-button" type="button">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="m12 3 9 5-9 5-9-5 9-5ZM3 12l9 5 9-5M3 16l9 5 9-5" />
+            </svg>
+            <span>Research dashboard</span>
+          </button>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <button id="toggle-sidebar" class="icon-button" type="button" title="Toggle sidebar" aria-label="Toggle sidebar">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+              <path d="M4 7h16M4 12h16M4 17h16" />
+            </svg>
+          </button>
+
+          <div class="title-block">
+            <h1 id="session-title">New research</h1>
+            <span id="session-meta" class="session-meta"></span>
+          </div>
+
+          <div class="topbar-actions">
+            <span id="connection" class="connection-dot offline" title="Connecting…"></span>
+            <button id="theme-toggle" class="icon-button" type="button" title="Switch theme" aria-label="Switch theme">
+              <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+                <path d="M12 17a5 5 0 1 0 0-10 5 5 0 0 0 0 10ZM12 1v3M12 20v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M1 12h3M20 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1" />
+              </svg>
+            </button>
+            <label class="model-picker">
+              <span>Model</span>
+              <select id="model-select" aria-label="Model"></select>
+            </label>
+          </div>
+        </header>
+
+        <div id="chat" class="chat"></div>
+
+        <footer class="composer">
+          <div class="composer-shell">
+            <textarea
+              id="composer-input"
+              rows="1"
+              placeholder="Ask a question, or switch on Deep research…"
+              aria-label="Message"
+            ></textarea>
+            <div class="composer-bar">
+              <label class="research-toggle" title="Plan, crawl, and cite over multiple rounds">
+                <input id="research-mode" type="checkbox" />
+                <span class="toggle-track" aria-hidden="true"><span class="toggle-thumb"></span></span>
+                <span class="toggle-label">Deep research</span>
+              </label>
+              <span id="composer-hint" class="composer-hint">Enter to send · Shift+Enter for a new line</span>
+              <div class="composer-actions">
+                <button id="stop-button" class="button button-stop" type="button" hidden>
+                  <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor" aria-hidden="true">
+                    <rect x="7" y="7" width="10" height="10" rx="1.5" />
+                  </svg>
+                  <span>Stop</span>
+                </button>
+                <button id="send-button" class="button button-primary" type="button">
+                  <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M4 12 21 4l-3.5 17L12 15l-8-3Z" />
+                    <path d="M12 15v6" />
+                  </svg>
+                  <span>Send</span>
+                </button>
+              </div>
+            </div>
+          </div>
+          <p class="composer-footnote">Wandey runs locally. Web content is untrusted; sources are always one click away.</p>
+        </footer>
+      </main>
+    </div>
+
+    <div id="modal-root"></div>
+    <div id="toast-root" aria-live="polite"></div>
+    <noscript><p style="padding: 2rem">Wandey needs JavaScript enabled.</p></noscript>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
