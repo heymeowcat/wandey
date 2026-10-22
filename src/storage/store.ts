@@ -9,6 +9,7 @@ import type {
   PartType,
   ResearchDepth,
   ResearchJob,
+  ResearchJobState,
   ResearchPlan,
   Session,
   SessionDetail,
@@ -334,13 +335,14 @@ export class Store {
       report: null,
       error: null,
       outputPath: null,
+      state: null,
       createdAt: timestamp,
       updatedAt: timestamp,
     };
     this.db
       .query(
-        `insert into research_job (id, session_id, question, depth, status, plan, report, error, output_path, created_at, updated_at)
-         values (?, ?, ?, ?, ?, null, null, null, null, ?, ?)`,
+        `insert into research_job (id, session_id, question, depth, status, plan, report, error, output_path, state, created_at, updated_at)
+         values (?, ?, ?, ?, ?, null, null, null, null, null, ?, ?)`,
       )
       .run(job.id, job.sessionID, job.question, job.depth, job.status, timestamp, timestamp);
     return job;
@@ -348,14 +350,14 @@ export class Store {
 
   updateResearchJob(
     id: string,
-    patch: Partial<Pick<ResearchJob, "status" | "plan" | "report" | "error" | "outputPath">>,
+    patch: Partial<Pick<ResearchJob, "status" | "plan" | "report" | "error" | "outputPath" | "state">>,
   ): ResearchJob | null {
     const job = this.getResearchJob(id);
     if (!job) return null;
     const next: ResearchJob = { ...job, ...patch, updatedAt: now() };
     this.db
       .query(
-        "update research_job set status = ?, plan = ?, report = ?, error = ?, output_path = ?, updated_at = ? where id = ?",
+        "update research_job set status = ?, plan = ?, report = ?, error = ?, output_path = ?, state = ?, updated_at = ? where id = ?",
       )
       .run(
         next.status,
@@ -363,10 +365,69 @@ export class Store {
         next.report,
         next.error,
         next.outputPath,
+        next.state ? JSON.stringify(next.state) : null,
         next.updatedAt,
         id,
       );
     return next;
+  }
+
+  /**
+   * A process that died mid-research cannot still be running. Mark those jobs
+   * resumable on the next boot instead of leaving the UI stuck on "running".
+   */
+  recoverInterruptedResearchJobs(message = "Interrupted by a server restart. Resume it to continue."): number {
+    const jobs = this.db
+      .query("select id, session_id from research_job where status in ('pending', 'running')")
+      .all() as Array<{ id: string; session_id: string }>;
+    if (jobs.length === 0) return 0;
+
+    this.db
+      .query(
+        `update research_job
+         set status = 'aborted', error = coalesce(error, ?), updated_at = ?
+         where status in ('pending', 'running')`,
+      )
+      .run(message, now());
+
+    // The job row is what powers Resume; the part is what the conversation
+    // renders. Mark live research cards interrupted too, otherwise a restart
+    // leaves an endless "running" card with no Resume button.
+    for (const job of jobs) {
+      for (const part of this.listResearchParts(job.session_id, job.id)) {
+        if (part.type !== "research" || part.data.status !== "running") continue;
+        this.updatePart(part.id, {
+          ...part.data,
+          status: "error" as const,
+          error: message,
+          progress: {
+            ...part.data.progress,
+            stage: "error" as const,
+            message,
+            current: [],
+          },
+        });
+      }
+    }
+    return jobs.length;
+  }
+
+  /** All research parts for a job, newest first. */
+  listResearchParts(sessionID: string, jobID: string): Part[] {
+    const rows = this.db
+      .query("select * from part where session_id = ? and type = 'research' order by created_at desc")
+      .all(sessionID) as PartRow[];
+    const output: Part[] = [];
+    for (const row of rows) {
+      const part = rowToPart(row);
+      if (part.type === "research" && part.data.jobID === jobID) output.push(part);
+    }
+    return output;
+  }
+
+  /** Find the latest research part for a job, used to recover legacy progress. */
+  findResearchPart(sessionID: string, jobID: string): Part | null {
+    return this.listResearchParts(sessionID, jobID)[0] ?? null;
   }
 
   getResearchJob(id: string): ResearchJob | null {
@@ -494,6 +555,7 @@ interface ResearchJobRow {
   report: string | null;
   error: string | null;
   output_path: string | null;
+  state: string | null;
   created_at: number;
   updated_at: number;
 }
@@ -562,6 +624,7 @@ function rowToResearchJob(row: ResearchJobRow): ResearchJob {
     report: row.report,
     error: row.error,
     outputPath: row.output_path,
+    state: row.state ? (JSON.parse(row.state) as ResearchJobState) : null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };

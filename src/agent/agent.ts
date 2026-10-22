@@ -8,6 +8,7 @@ import type {
   ProviderEvent,
   QuestionPartData,
   ResearchDepth,
+  ResearchJob,
   Session,
   SourcePartData,
   ToolCallBlock,
@@ -127,6 +128,78 @@ export class Agent {
     if (!run) return false;
     run.controller.abort();
     return true;
+  }
+
+  abortAll(): void {
+    for (const run of this.runs.values()) run.controller.abort();
+  }
+
+  /**
+   * Continue a stopped research job outside the chat/tool loop. The job already
+   * owns its conversation, sources, and notes; this only creates a fresh
+   * assistant message so the resumed research card is visible in the timeline.
+   */
+  async resumeResearch(jobID: string): Promise<Message> {
+    const { store, bus, config } = this.deps;
+    const job = store.getResearchJob(jobID);
+    if (!job) throw new Error(`Research job ${jobID} not found`);
+    if (job.status === "done") throw new Error("This research job is already complete.");
+    if (this.runs.has(job.sessionID)) {
+      throw new Error("This session is already running. Wait for it to finish or stop it first.");
+    }
+    const session = store.getSession(job.sessionID);
+    if (!session) throw new Error("The session for this research job no longer exists.");
+
+    const model = job.state?.model?.trim() || session.model || config.agent.model || null;
+    const assistant = store.createMessage(job.sessionID, "assistant", model);
+    bus.publish({ type: "message.created", sessionID: job.sessionID, message: assistant });
+
+    const controller = new AbortController();
+    this.runs.set(job.sessionID, { controller });
+    void this.runResearchResume(job, assistant, model, controller)
+      .catch((err) => {
+        if (!controller.signal.aborted) console.error("[agent] research resume error:", err);
+      })
+      .finally(() => {
+        this.runs.delete(job.sessionID);
+        store.touchSession(job.sessionID);
+        bus.publish({ type: "session.status", sessionID: job.sessionID, status: "idle" });
+        const latest = store.getSession(job.sessionID);
+        if (latest) bus.publish({ type: "session.updated", session: latest });
+      });
+    return assistant;
+  }
+
+  private async runResearchResume(
+    job: ResearchJob,
+    message: Message,
+    model: string | null,
+    controller: AbortController,
+  ): Promise<void> {
+    const { store, bus } = this.deps;
+    bus.publish({ type: "session.status", sessionID: job.sessionID, status: "streaming" });
+    try {
+      await this.research.resume({
+        jobID: job.id,
+        messageID: message.id,
+        model: model ?? undefined,
+        signal: controller.signal,
+      });
+      const saved = store.updateMessage(message.id, { finishReason: "stop" });
+      if (saved) bus.publish({ type: "message.updated", sessionID: job.sessionID, message: saved });
+    } catch (err) {
+      const aborted = controller.signal.aborted || (err as Error).name === "AbortError";
+      const detail = aborted ? "Stopped by user." : (err as Error).message;
+      const saved = store.updateMessage(message.id, {
+        finishReason: aborted ? "aborted" : "error",
+        error: aborted ? null : detail,
+      });
+      if (saved) bus.publish({ type: "message.updated", sessionID: job.sessionID, message: saved });
+      if (!aborted) {
+        this.addErrorPart(job.sessionID, message.id, detail);
+        bus.publish({ type: "session.error", sessionID: job.sessionID, message: detail });
+      }
+    }
   }
 
   answerQuestion(questionID: string, answer: string[], custom?: string): boolean {

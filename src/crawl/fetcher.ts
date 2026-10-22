@@ -74,6 +74,9 @@ export class PageFetcher {
         },
       });
     } catch (err) {
+      if (options.signal?.aborted || (err as Error).name === "AbortError") {
+        throw new DOMException("Aborted", "AbortError");
+      }
       return errorPage(url, (err as Error).name === "TimeoutError" ? `Timed out after ${this.config.timeoutMs}ms` : (err as Error).message, 0);
     }
 

@@ -277,6 +277,9 @@ export class SearchService {
         },
       });
     } catch (err) {
+      if (signal?.aborted || (err as Error).name === "AbortError") {
+        throw new DOMException("Aborted", "AbortError");
+      }
       throw new Error(`${label}: ${(err as Error).message}`);
     }
     if (!response.ok) {

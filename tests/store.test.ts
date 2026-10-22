@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import type { EvidenceNote, FetchedPage, ResearchPlan } from "../src/core/types.ts";
+import type { EvidenceNote, FetchedPage, ResearchJobState, ResearchPlan } from "../src/core/types.ts";
 import { Store } from "../src/storage/store.ts";
 
 function page(overrides: Partial<FetchedPage> = {}): FetchedPage {
@@ -199,6 +199,112 @@ describe("Store research jobs and notes", () => {
     expect(loaded?.plan).toEqual(plan);
     expect(loaded?.report).toContain("[s1]");
     expect(store.listResearchJobs(session.id).map((item) => item.id)).toEqual([job.id]);
+  });
+
+  test("round-trips checkpoints and recovers interrupted jobs", () => {
+    const session = store.createSession({ mode: "research" });
+    const job = store.createResearchJob({
+      sessionID: session.id,
+      question: "What changed?",
+      depth: "deep",
+    });
+    const plan: ResearchPlan = {
+      restatedQuestion: "What changed?",
+      scope: "Test scope",
+      subQuestions: [{ id: "q1", question: "First?", queries: ["first"] }],
+    };
+    const message = store.createMessage(session.id, "assistant");
+    const part = store.addPart(session.id, message.id, "research", {
+      jobID: job.id,
+      question: job.question,
+      depth: job.depth,
+      status: "running",
+      progress: {
+        stage: "searching",
+        message: "Searching",
+        subQuestionsDone: 0,
+        subQuestionsTotal: 1,
+        sourcesFound: 0,
+        pagesFetched: 0,
+        round: 1,
+        roundTotal: 1,
+        current: [],
+      },
+    });
+    const state: ResearchJobState = {
+      model: "test/model",
+      allQuestions: plan.subQuestions,
+      rounds: [{ round: 1, questions: plan.subQuestions, completed: ["q1"] }],
+      candidates: [
+        {
+          url: "https://example.com/a",
+          title: "A",
+          snippet: "Snippet",
+          provider: "test",
+          subQuestionIDs: ["q1"],
+        },
+      ],
+      pages: [{ url: "https://example.com/a", sourceID: "s1" }],
+      warnings: ["a warning"],
+      progress: {
+        stage: "synthesizing",
+        message: "Writing the report",
+        subQuestionsDone: 1,
+        subQuestionsTotal: 2,
+        sourcesFound: 1,
+        pagesFetched: 1,
+        round: 1,
+        roundTotal: 3,
+        current: [],
+      },
+    };
+
+    store.updateResearchJob(job.id, { status: "running", plan, state });
+    const loaded = store.getResearchJob(job.id);
+    expect(loaded?.state).toEqual(state);
+    expect(store.recoverInterruptedResearchJobs()).toBe(1);
+
+    const recovered = store.getResearchJob(job.id);
+    expect(recovered?.status).toBe("aborted");
+    expect(recovered?.error).toContain("server restart");
+    expect(recovered?.state).toEqual(state);
+    const recoveredPart = store.listResearchParts(session.id, job.id).find((item) => item.id === part.id);
+    expect(recoveredPart?.type).toBe("research");
+    if (recoveredPart?.type === "research") {
+      expect(recoveredPart.data.status).toBe("error");
+      expect(recoveredPart.data.progress.stage).toBe("error");
+      expect(recoveredPart.data.error).toContain("server restart");
+    }
+    expect(store.recoverInterruptedResearchJobs()).toBe(0);
+  });
+
+  test("finds the latest research part for a job", () => {
+    const session = store.createSession({ mode: "research" });
+    const message = store.createMessage(session.id, "assistant");
+    const job = store.createResearchJob({
+      sessionID: session.id,
+      question: "What changed?",
+      depth: "quick",
+    });
+    const part = store.addPart(session.id, message.id, "research", {
+      jobID: job.id,
+      question: job.question,
+      depth: job.depth,
+      status: "running",
+      progress: {
+        stage: "planning",
+        message: "Planning",
+        subQuestionsDone: 0,
+        subQuestionsTotal: 0,
+        sourcesFound: 0,
+        pagesFetched: 0,
+        round: 0,
+        roundTotal: 1,
+        current: [],
+      },
+    });
+    expect(store.findResearchPart(session.id, job.id)?.id).toBe(part.id);
+    expect(store.findResearchPart(session.id, "job_missing")).toBeNull();
   });
 
   test("stores evidence notes in insertion order", () => {

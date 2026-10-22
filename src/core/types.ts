@@ -324,6 +324,36 @@ export interface ResearchPlan {
   subQuestions: SubQuestion[];
 }
 
+export interface ResearchCandidateState {
+  url: string;
+  title: string;
+  snippet: string;
+  provider: string;
+  publishedAt?: string;
+  subQuestionIDs: string[];
+}
+
+export interface ResearchRoundState {
+  round: number;
+  questions: SubQuestion[];
+  completed: string[];
+}
+
+/**
+ * A durable checkpoint for a deep-research run. The plan, notes, and sources
+ * live in their own tables; this holds the in-memory pipeline state needed to
+ * continue without repeating completed searches, reads, or extractions.
+ */
+export interface ResearchJobState {
+  model: string;
+  allQuestions: SubQuestion[];
+  rounds: ResearchRoundState[];
+  candidates: ResearchCandidateState[];
+  pages: Array<{ url: string; sourceID: string }>;
+  warnings: string[];
+  progress: ResearchProgress;
+}
+
 export interface ResearchJob {
   id: string;
   sessionID: string;
@@ -334,6 +364,7 @@ export interface ResearchJob {
   report: string | null;
   error: string | null;
   outputPath: string | null;
+  state: ResearchJobState | null;
   createdAt: number;
   updatedAt: number;
 }

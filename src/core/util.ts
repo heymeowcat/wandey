@@ -150,22 +150,42 @@ function findFirst(text: string, chars: string[]): number {
   return best;
 }
 
-/** Run async tasks with a concurrency cap, preserving result order. */
+/**
+ * Run async tasks with a concurrency cap, preserving result order.
+ *
+ * When a signal is supplied, no new work is scheduled after cancellation. We
+ * also wait for every worker to settle before rethrowing: a caller that marks a
+ * research job aborted should not have older workers writing progress or notes
+ * after the fact.
+ */
 export async function mapLimit<T, R>(
   items: T[],
   limit: number,
   fn: (item: T, index: number) => Promise<R>,
+  signal?: AbortSignal,
 ): Promise<R[]> {
   const results = new Array<R>(items.length);
   let cursor = 0;
+  let failed = false;
   const workers = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
-    while (true) {
+    while (!failed && !signal?.aborted) {
       const index = cursor++;
       if (index >= items.length) return;
-      results[index] = await fn(items[index]!, index);
+      try {
+        results[index] = await fn(items[index]!, index);
+      } catch (err) {
+        failed = true;
+        throw err;
+      }
+    }
+    if (signal?.aborted && cursor <= items.length) {
+      throw new DOMException("Aborted", "AbortError");
     }
   });
-  await Promise.all(workers);
+
+  const settled = await Promise.allSettled(workers);
+  const failure = settled.find((entry): entry is PromiseRejectedResult => entry.status === "rejected");
+  if (failure) throw failure.reason;
   return results;
 }
 

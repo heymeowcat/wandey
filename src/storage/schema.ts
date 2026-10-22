@@ -97,4 +97,8 @@ export const MIGRATIONS: string[] = [
     value text not null
   );
   `,
+  // 1 -> 2
+  `
+  alter table research_job add column state text;
+  `,
 ];

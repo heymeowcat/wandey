@@ -56,6 +56,10 @@ export async function startServer(options: ServerOptions): Promise<WandeyServer>
   fs.mkdirSync(paths.cacheDir, { recursive: true });
 
   const store = new Store(paths.dbFile);
+  const recovered = store.recoverInterruptedResearchJobs();
+  if (recovered > 0) {
+    console.error(`[research] marked ${recovered} interrupted job(s) resumable`);
+  }
   const registry = new ProviderRegistry(config);
   const bus = new Bus();
   const fetcher = new PageFetcher(config.crawl);
@@ -203,6 +207,19 @@ export async function startServer(options: ServerOptions): Promise<WandeyServer>
           return json({ error: "Not found" }, 404);
         }
 
+        const resumeMatch = pathname.match(/^\/api\/research\/([^/]+)\/resume$/);
+        if (resumeMatch && req.method === "POST") {
+          const jobID = decodeURIComponent(resumeMatch[1]!);
+          const job = store.getResearchJob(jobID);
+          if (!job) return json({ error: "Research job not found" }, 404);
+          try {
+            const message = await agent.resumeResearch(jobID);
+            return json({ message }, 202);
+          } catch (err) {
+            return json({ error: (err as Error).message }, 409);
+          }
+        }
+
         const jobMatch = pathname.match(/^\/api\/research\/([^/]+)$/);
         if (jobMatch && req.method === "GET") {
           const job = store.getResearchJob(decodeURIComponent(jobMatch[1]!));
@@ -305,6 +322,8 @@ export async function startServer(options: ServerOptions): Promise<WandeyServer>
     bus,
     registry,
     stop() {
+      agent.abortAll();
+      store.recoverInterruptedResearchJobs("Interrupted by a server shutdown. Resume it to continue.");
       server.stop(true);
       store.close();
     },
