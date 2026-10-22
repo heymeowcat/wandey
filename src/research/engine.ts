@@ -300,9 +300,11 @@ class ResearchRun {
   async execute(resume = false): Promise<ResearchOutcome> {
     try {
       if (resume) {
-        if (this.job.state) {
+        if (this.job.state && this.job.state.rounds.length > 0) {
           this.restoreCheckpoint(this.job.state);
         } else if (this.job.plan) {
+          // Empty round state means this is either a pre-checkpoint job or a
+          // legacy recovery that failed during synthesis. Recover from notes.
           return await this.finishLegacyJob();
         }
       }
