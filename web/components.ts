@@ -236,7 +236,12 @@ function renderResearchPart(id: string, data: ResearchPartData): HTMLElement {
   };
   card.append(el("div", { class: "research-stage", text: stageNames[progress.stage] ?? progress.stage }));
 
-  const track = el("div", { class: "progress-track", role: "progressbar", "aria-valuenow": percent });
+  const track = el("div", {
+    class: "progress-track",
+    role: "progressbar",
+    "aria-label": "Research progress",
+    "aria-valuenow": percent,
+  });
   track.append(el("div", { class: "progress-fill", style: { width: `${percent}%` } }));
   card.append(track);
 
@@ -344,6 +349,13 @@ export function renderEmptyState(): HTMLElement {
     grid.append(card);
   }
   wrap.append(grid);
+  const providerLink = el("button", {
+    class: "empty-provider-link",
+    type: "button",
+    dataset: { openProviders: "" },
+  });
+  providerLink.append(icon("sliders", 14), document.createTextNode("Manage provider connections"));
+  wrap.append(providerLink);
   return wrap;
 }
 
@@ -390,6 +402,7 @@ export interface ModalHandle {
   dialog: HTMLElement;
   body: HTMLElement;
   close: () => void;
+  focus: (selector?: string) => void;
 }
 
 export interface ModalOptions {
@@ -411,6 +424,7 @@ export function openModal(options: ModalOptions = {}): ModalHandle {
     role: "dialog",
     "aria-modal": "true",
     "aria-label": options.title ?? "Dialog",
+    tabindex: "-1",
   });
 
   if (options.title || options.subtitle) {
@@ -434,9 +448,45 @@ export function openModal(options: ModalOptions = {}): ModalHandle {
   root.append(backdrop);
 
   const previousFocus = document.activeElement as HTMLElement | null;
+  const focusableSelector =
+    'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+  function focusable(): HTMLElement[] {
+    return [...dialog.querySelectorAll<HTMLElement>(focusableSelector)].filter(
+      (element) => !element.hidden && element.offsetParent !== null,
+    );
+  }
+
+  function focus(selector?: string): void {
+    const target =
+      (selector ? dialog.querySelector<HTMLElement>(selector) : null) ??
+      focusable()[0] ??
+      dialog;
+    target.focus();
+  }
 
   function onKeydown(event: KeyboardEvent): void {
-    if (event.key === "Escape" && options.dismissible !== false) close();
+    if (event.key === "Escape" && options.dismissible !== false) {
+      close();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const items = focusable();
+    if (items.length === 0) {
+      event.preventDefault();
+      dialog.focus();
+      return;
+    }
+    const first = items[0]!;
+    const last = items[items.length - 1]!;
+    const active = document.activeElement;
+    if (event.shiftKey && (active === first || !dialog.contains(active))) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && (active === last || !dialog.contains(active))) {
+      event.preventDefault();
+      first.focus();
+    }
   }
   document.addEventListener("keydown", onKeydown);
   backdrop.addEventListener("click", (event) => {
@@ -454,11 +504,10 @@ export function openModal(options: ModalOptions = {}): ModalHandle {
   }
 
   setTimeout(() => {
-    const target = dialog.querySelector<HTMLElement>("input, textarea, button");
-    target?.focus();
+    if (!dialog.contains(document.activeElement)) focus();
   }, 30);
 
-  return { backdrop, dialog, body, close };
+  return { backdrop, dialog, body, close, focus };
 }
 
 export function showToast(level: "info" | "error" | "success", message: string): void {

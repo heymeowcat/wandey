@@ -25,6 +25,8 @@ import {
 import { formatDateTime, formatNumber } from "./format.ts";
 import { icon } from "./icons.ts";
 import { setMarkdown } from "./markdown.ts";
+import { openModelPicker } from "./model-picker.ts";
+import { openProviderModal } from "./providers.ts";
 
 /**
  * The browser controller.
@@ -67,13 +69,17 @@ const els = {
   sidebar: $("sidebar"),
   sessionList: $("session-list"),
   newSession: $<HTMLButtonElement>("new-session"),
-  providerSummary: $("provider-summary"),
+  providerSummary: $<HTMLButtonElement>("provider-summary"),
   dashboardButton: $<HTMLButtonElement>("dashboard-button"),
   toggleSidebar: $<HTMLButtonElement>("toggle-sidebar"),
   sessionTitle: $("session-title"),
   sessionMeta: $("session-meta"),
   connection: $("connection"),
-  modelSelect: $<HTMLSelectElement>("model-select"),
+  modelButton: $<HTMLButtonElement>("model-button"),
+  modelButtonMark: $("model-button-mark"),
+  modelButtonName: $("model-button-name"),
+  modelButtonMeta: $("model-button-meta"),
+  modelButtonBadges: $("model-button-badges"),
   themeToggle: $<HTMLButtonElement>("theme-toggle"),
   chat: $("chat"),
   composerInput: $<HTMLTextAreaElement>("composer-input"),
@@ -110,7 +116,7 @@ async function boot(): Promise<void> {
   else await createSession();
 }
 
-async function loadModels(): Promise<void> {
+async function loadModels(options: { quiet?: boolean } = {}): Promise<{ models: ModelInfo[]; providers: ProviderInfo[] } | null> {
   try {
     const data = await api.models();
     state.models = data.models;
@@ -118,14 +124,32 @@ async function loadModels(): Promise<void> {
     if (!state.selectedModel && state.models.length > 0) {
       state.selectedModel = state.models.find((model) => model.supportsTools !== false)?.ref ?? state.models[0]!.ref;
     }
-    rebuildModelOptions();
+    renderModelButton();
     renderProviderSummary();
-    if (state.models.length === 0) {
-      showToast("error", "No models are available. Start Ollama or add a provider key, then reload.");
+    renderHeader();
+    renderComposer();
+    if (state.models.length === 0 && !options.quiet) {
+      showToast("info", "No models yet. Connect a provider to get started.");
     }
+    return data;
   } catch (err) {
     showToast("error", `Could not load models: ${(err as Error).message}`);
+    return null;
   }
+}
+
+async function refreshModelsData(): Promise<{ models: ModelInfo[]; providers: ProviderInfo[] }> {
+  const data = await api.refreshProviders();
+  state.models = data.models;
+  state.providers = data.providers;
+  if (!state.selectedModel && state.models.length > 0) {
+    state.selectedModel = state.models.find((model) => model.supportsTools !== false)?.ref ?? state.models[0]!.ref;
+  }
+  renderModelButton();
+  renderProviderSummary();
+  renderHeader();
+  renderComposer();
+  return { models: data.models, providers: data.providers };
 }
 
 async function refreshSessions(): Promise<void> {
@@ -148,7 +172,7 @@ async function loadSession(id: string): Promise<void> {
     state.selectedModel = detail.session.model ?? state.selectedModel;
     localStorage.setItem("wandey.session", id);
     if (state.selectedModel) localStorage.setItem("wandey.model", state.selectedModel);
-    syncModelSelect();
+    renderModelButton();
     subscribe(id);
     renderAll();
 
@@ -189,7 +213,7 @@ async function createSession(): Promise<void> {
 function renderAll(): void {
   renderSidebar();
   renderHeader();
-  syncModelSelect();
+  renderModelButton();
   renderChat();
   renderComposer();
 }
@@ -217,12 +241,62 @@ function renderSidebar(): void {
 }
 
 function renderProviderSummary(): void {
-  const active = state.providers.filter((provider) => provider.modelCount > 0);
-  if (active.length === 0) {
-    els.providerSummary.textContent = "No providers configured";
+  clear(els.providerSummary);
+  const connected = state.providers.filter((provider) => provider.modelCount > 0);
+  const attention = state.providers.filter(
+    (provider) => provider.modelCount === 0 && provider.error && provider.auto !== "local",
+  );
+  const dot = el("span", { class: `provider-summary-dot${connected.length > 0 ? " ready" : ""}${attention.length > 0 ? " attention" : ""}` });
+  const copy = el("span", { class: "provider-summary-copy" });
+  const title = el("span", { class: "provider-summary-title" });
+  const sub = el("span", { class: "provider-summary-sub" });
+
+  if (connected.length === 0) {
+    title.textContent = "Connect a provider";
+    sub.textContent = attention.length > 0 ? "A configured provider needs attention" : "Add an API key or start a local server";
+  } else {
+    const names = connected.map((provider) => provider.name);
+    title.textContent = names.length <= 2 ? names.join(" + ") : `${names[0]} + ${names.length - 1} more`;
+    const count = connected.reduce((sum, provider) => sum + provider.modelCount, 0);
+    sub.textContent = `${count} models${attention.length > 0 ? ` · ${attention.length} needs attention` : ""}`;
+  }
+  copy.append(title, sub);
+  const chevron = el("span", { class: "provider-summary-chevron" });
+  chevron.append(icon("chevron", 13));
+  els.providerSummary.append(dot, copy, chevron);
+  els.providerSummary.classList.toggle("attention", attention.length > 0);
+  els.providerSummary.title = "Manage provider connections";
+}
+
+function renderModelButton(): void {
+  const ref = state.detail?.session.model ?? state.selectedModel;
+  const model = ref ? state.models.find((entry) => entry.ref === ref) : undefined;
+  const provider = model ? state.providers.find((entry) => entry.id === model.provider) : undefined;
+
+  clear(els.modelButtonBadges);
+  els.modelButton.classList.toggle("is-empty", !ref);
+  els.modelButton.classList.toggle("is-missing", Boolean(ref) && !model);
+
+  if (!ref) {
+    els.modelButtonMark.textContent = "?";
+    els.modelButtonMark.style.removeProperty("--provider-hue");
+    els.modelButtonName.textContent = "Choose a model";
+    els.modelButtonMeta.textContent = state.models.length > 0 ? "Select a model to start" : "No models connected";
+    els.modelButton.title = "Choose a model";
     return;
   }
-  els.providerSummary.textContent = `${active.map((provider) => provider.name).join(", ")} · ${state.models.length} models`;
+
+  const name = model?.name ?? shortModel(ref);
+  els.modelButtonMark.textContent = (provider?.name ?? ref).slice(0, 1).toUpperCase();
+  els.modelButtonMark.style.setProperty("--provider-hue", providerHue(provider?.id ?? ref.split("/")[0] ?? ref));
+  els.modelButtonName.textContent = name;
+  els.modelButtonMeta.textContent = model
+    ? `${provider?.name ?? model.provider}${model.free ? " · free" : ""}`
+    : "Not available right now";
+  els.modelButton.title = model ? `Change model · ${ref}` : `Current model is unavailable · ${ref}`;
+
+  if (model?.free) els.modelButtonBadges.append(el("span", { class: "model-badge badge-free", text: "Free" }));
+  if (provider?.local) els.modelButtonBadges.append(el("span", { class: "model-badge badge-local", text: "Local" }));
 }
 
 function renderChat(forceBottom = false): void {
@@ -245,52 +319,19 @@ function renderComposer(): void {
   const mode = session?.mode ?? "chat";
   els.researchMode.checked = mode === "research";
   els.researchMode.disabled = state.running || !session;
-  els.sendButton.disabled = state.running || !session;
+  els.sendButton.disabled = state.running || !session || state.models.length === 0;
+  els.sendButton.title = state.models.length === 0 ? "Connect a provider before sending a message" : "Send";
   els.stopButton.hidden = !state.running;
-  els.modelSelect.disabled = state.running || state.models.length === 0;
-  els.composerHint.textContent = state.running
-    ? state.status === "waiting"
-      ? "Answer the question above to continue"
-      : "Wandey is working…"
-    : "Enter to send · Shift+Enter for a new line";
+  els.modelButton.disabled = state.models.length === 0 && state.providers.length === 0;
+  els.composerHint.textContent =
+    state.models.length === 0
+      ? "Connect a provider to start chatting"
+      : state.running
+        ? state.status === "waiting"
+          ? "Answer the question above to continue"
+          : "Wandey is working…"
+        : "Enter to send · Shift+Enter for a new line";
   resizeComposer();
-}
-
-function rebuildModelOptions(): void {
-  clear(els.modelSelect);
-  if (state.models.length === 0) {
-    els.modelSelect.append(el("option", { value: "", text: "No models available" }));
-    els.modelSelect.disabled = true;
-    return;
-  }
-
-  const groups = new Map<string, ModelInfo[]>();
-  for (const model of state.models) {
-    const list = groups.get(model.provider) ?? [];
-    list.push(model);
-    groups.set(model.provider, list);
-  }
-
-  for (const [providerID, models] of groups) {
-    const provider = state.providers.find((entry) => entry.id === providerID);
-    const label = `${provider?.name ?? providerID}${provider?.local ? " · local" : ""}`;
-    const group = el("optgroup", { label }) as HTMLOptGroupElement;
-    for (const model of models) {
-      const suffix = model.free ? " · free" : "";
-      group.append(el("option", { value: model.ref, text: `${model.name}${suffix}` }));
-    }
-    els.modelSelect.append(group);
-  }
-}
-
-function syncModelSelect(): void {
-  if (state.models.length === 0) return;
-  const desired = state.detail?.session.model ?? state.selectedModel;
-  if (!desired) return;
-  if (![...els.modelSelect.options].some((option) => option.value === desired)) {
-    els.modelSelect.append(el("option", { value: desired, text: desired }));
-  }
-  els.modelSelect.value = desired;
 }
 
 function applySessionUpdate(session: Session): void {
@@ -302,7 +343,7 @@ function applySessionUpdate(session: Session): void {
     state.detail.session = session;
     if (session.model) {
       state.selectedModel = session.model;
-      syncModelSelect();
+      renderModelButton();
     }
   }
   renderSidebar();
@@ -372,17 +413,52 @@ async function resumeResearch(jobID: string): Promise<void> {
   }
 }
 
-async function changeModel(): Promise<void> {
-  const ref = els.modelSelect.value;
-  if (!ref || !state.detail) return;
+async function selectModel(ref: string): Promise<void> {
+  if (!ref) return;
+  const session = state.detail?.session;
+  const previousSelected = state.selectedModel;
+  const previousSessionModel = session?.model ?? null;
+
   state.selectedModel = ref;
   localStorage.setItem("wandey.model", ref);
+  if (session) session.model = ref;
+  renderModelButton();
+  renderHeader();
+  renderComposer();
+
+  if (!session) return;
   try {
-    const { session } = await api.updateSession(state.detail.session.id, { model: ref });
-    applySessionUpdate(session);
+    const { session: updated } = await api.updateSession(session.id, { model: ref });
+    applySessionUpdate(updated);
   } catch (err) {
+    state.selectedModel = previousSelected;
+    if (session) session.model = previousSessionModel;
+    if (previousSelected) localStorage.setItem("wandey.model", previousSelected);
+    renderModelButton();
+    renderHeader();
+    renderComposer();
     showToast("error", `Could not change model: ${(err as Error).message}`);
   }
+}
+
+function openModelPickerModal(): void {
+  openModelPicker({
+    models: state.models,
+    providers: state.providers,
+    selected: state.detail?.session.model ?? state.selectedModel,
+    running: state.running,
+    onSelect: (ref) => void selectModel(ref),
+    onManageProviders: () => openProvidersModal(),
+    onRefresh: refreshModelsData,
+  });
+}
+
+function openProvidersModal(): void {
+  openProviderModal({
+    onChange: async () => {
+      await loadModels({ quiet: true });
+    },
+  });
 }
 
 async function changeMode(): Promise<void> {
@@ -1032,7 +1108,8 @@ function bindEvents(): void {
   els.newSession.addEventListener("click", () => void createSession());
   els.sendButton.addEventListener("click", () => void sendPrompt());
   els.stopButton.addEventListener("click", () => void stopRun());
-  els.modelSelect.addEventListener("change", () => void changeModel());
+  els.modelButton.addEventListener("click", () => openModelPickerModal());
+  els.providerSummary.addEventListener("click", () => openProvidersModal());
   els.researchMode.addEventListener("change", () => void changeMode());
   els.dashboardButton.addEventListener("click", () => void openDashboard());
   els.themeToggle.addEventListener("click", toggleTheme);
@@ -1100,6 +1177,11 @@ function bindEvents(): void {
       els.composerInput.value = suggestion.dataset.prompt;
       resizeComposer();
       els.composerInput.focus();
+      return;
+    }
+    const providers = target.closest<HTMLElement>("[data-open-providers]");
+    if (providers) {
+      openProvidersModal();
     }
   });
 
@@ -1193,6 +1275,12 @@ function toggleTheme(): void {
 function shortModel(ref: string): string {
   const parts = ref.split("/");
   return parts[parts.length - 1] ?? ref;
+}
+
+function providerHue(id: string): string {
+  let hash = 0;
+  for (let index = 0; index < id.length; index++) hash = (hash * 31 + id.charCodeAt(index)) % 360;
+  return String(hash);
 }
 
 function host(url: string): string {

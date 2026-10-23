@@ -29,8 +29,45 @@ export interface ProviderInfo {
   authenticated: boolean;
   local: boolean;
   source: string;
+  auto?: "env" | "local" | "opencode";
   modelCount: number;
+  models?: string[];
   error?: string;
+}
+
+export interface ProviderCatalogEntry extends ProviderInfo {
+  description: string;
+  configured: boolean;
+  connected: boolean;
+  keyStored: boolean;
+  custom: boolean;
+  disabled: boolean;
+  env: string[];
+  docs?: string;
+}
+
+export interface ProvidersResponse {
+  providers: ProviderInfo[];
+  catalog: ProviderCatalogEntry[];
+  configFile: string;
+  opencode: boolean;
+}
+
+export interface ProviderMutationResponse {
+  id?: string;
+  provider?: ProviderInfo | null;
+  models: ModelInfo[];
+  providers: ProviderInfo[];
+  catalog: ProviderCatalogEntry[];
+}
+
+export interface ProviderUpsert {
+  id?: string;
+  name?: string;
+  kind?: "openai" | "anthropic" | "gemini";
+  baseUrl?: string;
+  apiKey?: string;
+  models?: string[];
 }
 
 export interface LoadedSessionDetail extends SessionDetail {
@@ -73,6 +110,25 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 
 export const api = {
   models: () => request<ModelsResponse>("/api/models"),
+
+  providers: () => request<ProvidersResponse>("/api/providers"),
+
+  connectProvider: (provider: ProviderUpsert) =>
+    request<ProviderMutationResponse>("/api/providers", {
+      method: "POST",
+      body: JSON.stringify(provider),
+    }),
+
+  disconnectProvider: (id: string) =>
+    request<ProviderMutationResponse & { ok: boolean }>(`/api/providers/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    }),
+
+  refreshProviders: () =>
+    request<{ models: ModelInfo[]; providers: ProviderInfo[]; catalog: ProviderCatalogEntry[] }>(
+      "/api/providers/refresh",
+      { method: "POST" },
+    ),
 
   sessions: () => request<{ sessions: Session[] }>("/api/sessions"),
 

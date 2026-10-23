@@ -5,6 +5,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="dark light" />
     <meta name="theme-color" content="#0d0f14" />
+    <meta
+      name="description"
+      content="Wandey is a local-first research agent with provider-agnostic models, persistent deep research, and configurable crawling."
+    />
     <title>wandey</title>
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="/styles.css" />
@@ -39,7 +43,7 @@
         <nav id="session-list" class="session-list" aria-label="Sessions"></nav>
 
         <div class="sidebar-footer">
-          <div id="provider-summary" class="provider-summary"></div>
+          <button id="provider-summary" class="provider-summary" type="button" aria-haspopup="dialog" title="Manage providers"></button>
           <button id="dashboard-button" class="dashboard-button" type="button">
             <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="m12 3 9 5-9 5-9-5 9-5ZM3 12l9 5 9-5M3 16l9 5 9-5" />
@@ -69,10 +73,17 @@
                 <path d="M12 17a5 5 0 1 0 0-10 5 5 0 0 0 0 10ZM12 1v3M12 20v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M1 12h3M20 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1" />
               </svg>
             </button>
-            <label class="model-picker">
-              <span>Model</span>
-              <select id="model-select" aria-label="Model"></select>
-            </label>
+            <button id="model-button" class="model-trigger" type="button" aria-haspopup="dialog" title="Choose a model">
+              <span id="model-button-mark" class="model-trigger-mark" aria-hidden="true">?</span>
+              <span class="model-trigger-copy">
+                <span id="model-button-name" class="model-trigger-name">Choose a model</span>
+                <span id="model-button-meta" class="model-trigger-meta">No provider</span>
+              </span>
+              <span id="model-button-badges" class="model-trigger-badges"></span>
+              <svg class="model-trigger-chevron" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="m7 10 5 5 5-5" />
+              </svg>
+            </button>
           </div>
         </header>
 
