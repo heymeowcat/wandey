@@ -440,6 +440,13 @@ export function saveConfig(patch: Partial<Config>, paths: Paths): Config {
   };
   fs.mkdirSync(path.dirname(paths.configFile), { recursive: true });
   fs.writeFileSync(paths.configFile, `${JSON.stringify(output, null, 2)}\n`, "utf8");
+  // Config can contain API keys. Keep it private to the user when the platform
+  // supports POSIX permissions.
+  try {
+    fs.chmodSync(paths.configFile, 0o600);
+  } catch {
+    // Windows and some network filesystems do not support chmod.
+  }
   return merged;
 }
 

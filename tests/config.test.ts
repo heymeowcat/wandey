@@ -172,6 +172,15 @@ describe("saveConfig", () => {
     const loaded = loadConfig({ WANDEY_HOME: home, WANDEY_CONFIG: configFile });
     expect(loaded.config.server.port).toBe(6789);
   });
+
+  test("makes the config file private because it can contain keys", () => {
+    if (process.platform === "win32") return;
+    const home = tempDir("save-permissions");
+    const configFile = path.join(home, "config.json");
+    const paths = resolvePaths({ WANDEY_HOME: home, WANDEY_CONFIG: configFile });
+    saveConfig({ providers: { custom: { kind: "openai", apiKey: "secret" } } }, paths);
+    expect(fs.statSync(configFile).mode & 0o777).toBe(0o600);
+  });
 });
 
 describe("redactConfig", () => {

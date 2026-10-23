@@ -59,6 +59,7 @@ export class OpenAIProvider implements ProviderAdapter {
   async listModels(): Promise<ModelInfo[]> {
     const extra = this.options.models ?? [];
     let fetched: ModelInfo[] = [];
+    let listError: Error | null = null;
     try {
       const json = await fetchJSON<unknown>(
         joinURL(this.baseUrl, "/models"),
@@ -86,18 +87,26 @@ export class OpenAIProvider implements ProviderAdapter {
           supportsTools: supported.length > 0 ? supported.includes("tools") : true,
           supportsReasoning: supported.includes("reasoning") || supported.includes("include_reasoning"),
           supportsVision: supported.includes("vision") || /vision|vl/i.test(id),
-          free: inputCost === 0 && outputCost === 0,
+          free: (inputCost === 0 && outputCost === 0) || isOpenCodeFreeModel(this.options.id, id),
           costPerMTok: inputCost !== undefined || outputCost !== undefined
             ? { input: inputCost, output: outputCost }
             : undefined,
         } satisfies ModelInfo];
       });
-    } catch {
-      // Endpoint doesn't implement /models (or is offline). Extra models still work.
+    } catch (err) {
+      // A dead port or a rejected key is useful information for the provider
+      // screen. Keep it, but do not fail when curated fallback models exist.
+      listError = err instanceof Error ? err : new Error(String(err));
     }
 
     if (this.options.ollama) {
-      const discovered = await this.listOllamaCatalog();
+      let discovered: ModelInfo[] = [];
+      try {
+        discovered = await this.listOllamaCatalog();
+      } catch (err) {
+        if (listError && fetched.length === 0 && extra.length === 0) throw listError;
+        if (fetched.length === 0 && extra.length === 0) throw err;
+      }
       const ids = new Set(fetched.map((model) => model.id));
       for (const model of discovered) {
         if (ids.has(model.id)) continue;
@@ -105,6 +114,8 @@ export class OpenAIProvider implements ProviderAdapter {
         fetched.push(model);
       }
     }
+
+    if (listError && fetched.length === 0 && extra.length === 0) throw listError;
 
     const known = new Set(fetched.map((model) => model.id));
     for (const id of extra) {
@@ -128,17 +139,12 @@ export class OpenAIProvider implements ProviderAdapter {
    */
   private async listOllamaCatalog(): Promise<ModelInfo[]> {
     const origin = new URL(this.baseUrl).origin;
-    let localTags: unknown;
-    try {
-      localTags = await fetchJSON<unknown>(
-        `${origin}/api/tags`,
-        { headers: this.headers() },
-        { provider: this.options.id, timeoutMs: 6000 },
-      );
-    } catch {
-      // No local Ollama server: do not advertise cloud models that cannot be reached.
-      return [];
-    }
+    // No local Ollama server: let the registry surface the connection error.
+    const localTags = await fetchJSON<unknown>(
+      `${origin}/api/tags`,
+      { headers: this.headers() },
+      { provider: this.options.id, timeoutMs: 6000 },
+    );
 
     const cloudTags = await fetchJSON<unknown>(
       "https://ollama.com/api/tags",
@@ -356,6 +362,14 @@ function textFromContent(content: unknown): string {
       return "";
     })
     .join("");
+}
+
+/**
+ * OpenCode's model endpoint does not expose pricing. Its free-tier models are
+ * named with a `-free` suffix, plus the aliased `big-pickle`.
+ */
+export function isOpenCodeFreeModel(providerID: string, modelID: string): boolean {
+  return providerID === "opencode" && (modelID === "big-pickle" || /-free$/i.test(modelID));
 }
 
 function reasoningFromDelta(delta: Record<string, unknown>): string {

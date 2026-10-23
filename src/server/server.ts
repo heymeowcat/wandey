@@ -1,13 +1,15 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { Config, Paths } from "../core/config.ts";
-import { redactConfig } from "../core/config.ts";
+import type { Config, Paths, ProviderConfig } from "../core/config.ts";
+import { getApiKey, redactConfig, saveConfig } from "../core/config.ts";
 import type { EventBus } from "../core/events.ts";
 import { EventBus as Bus } from "../core/events.ts";
-import type { ClientEvent, ServerEvent, SessionMode } from "../core/types.ts";
+import type { ClientEvent, ProviderKind, ServerEvent, SessionMode } from "../core/types.ts";
 import { Agent } from "../agent/agent.ts";
 import { PageFetcher } from "../crawl/fetcher.ts";
 import { ProviderRegistry } from "../providers/registry.ts";
+import { templateFor } from "../providers/catalog.ts";
+import { openCodeProviderConfigs } from "../integrations/opencode.ts";
 import { SearchService } from "../search/search.ts";
 import { Store } from "../storage/store.ts";
 import { createToolRegistry } from "../tools/index.ts";
@@ -46,6 +48,15 @@ export interface WandeyServer {
 
 interface SocketData {
   sessionID: string | null;
+}
+
+interface ProviderUpsertBody {
+  id?: string;
+  name?: string;
+  kind?: ProviderKind;
+  baseUrl?: string;
+  apiKey?: string;
+  models?: string[] | string;
 }
 
 type Socket = Bun.ServerWebSocket<SocketData>;
@@ -97,6 +108,150 @@ export async function startServer(options: ServerOptions): Promise<WandeyServer>
     return bundle;
   }
 
+  async function upsertProvider(body: ProviderUpsertBody): Promise<Response> {
+    const requestedID = body.id?.trim().toLowerCase();
+    const id = requestedID || slugProviderID(body.name ?? "");
+    if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(id)) {
+      return json({ error: "Provider id can only contain lowercase letters, numbers, dots, dashes, and underscores." }, 400);
+    }
+
+    const template = templateFor(id);
+    const existing = config.providers[id];
+    // Display names are slugged into ids. Never let a new custom endpoint
+    // silently overwrite a built-in or another custom connection.
+    if (!requestedID && (existing || template)) {
+      return json(
+        { error: "A provider with that name already exists. Choose a different display name." },
+        409,
+      );
+    }
+
+    const name = body.name?.trim() || existing?.name || template?.name || id;
+    const kind = body.kind ?? existing?.kind ?? template?.kind ?? "openai";
+    if (kind !== "openai" && kind !== "anthropic" && kind !== "gemini") {
+      return json({ error: `Unsupported provider protocol "${kind}".` }, 400);
+    }
+
+    const baseUrl = (body.baseUrl?.trim() || existing?.baseUrl || template?.baseUrl || "").replace(/\/+$/, "");
+    if (!baseUrl) return json({ error: "A base URL is required for this endpoint." }, 400);
+    try {
+      new URL(baseUrl);
+    } catch {
+      return json({ error: "That base URL is not a valid URL." }, 400);
+    }
+
+    const local = body.baseUrl?.trim()
+      ? Boolean(template?.local || isLocalEndpoint(baseUrl))
+      : Boolean(existing?.local ?? template?.local ?? isLocalEndpoint(baseUrl));
+    const cfg: ProviderConfig = {
+      ...(existing ?? {}),
+      enabled: true,
+      name,
+      kind,
+      baseUrl,
+      local,
+    };
+    delete cfg.auto;
+
+    const apiKey = body.apiKey?.trim();
+    if (apiKey) cfg.apiKey = apiKey;
+    if (body.models !== undefined) {
+      const models = (Array.isArray(body.models) ? body.models : body.models.split(/[\n,]+/))
+        .map((entry) => String(entry).trim())
+        .filter(Boolean);
+      if (models.length > 0) cfg.models = [...new Set(models)];
+      else delete cfg.models;
+    }
+
+    // A remote provider cannot do anything without a key. Accept one from the
+    // form, the saved config, an env var, or a key imported from OpenCode.
+    // OpenAI-compatible custom endpoints may be unauthenticated proxies.
+    const key = getApiKey(id, cfg);
+    const imported = registry.catalog().find((entry) => entry.id === id);
+    // Disconnecting an OpenCode-imported provider hides it without deleting
+    // OpenCode's credentials. Reconnect can reuse those credentials because
+    // they are still present in OpenCode's own store.
+    const importedKey = config.integrations.opencode ? openCodeProviderConfigs()[id]?.apiKey : undefined;
+    const usesImportedKey = Boolean(importedKey) || (imported?.source === "opencode" && imported.authenticated);
+    if (!local && !key && !usesImportedKey) {
+      if (template) {
+        const env = template.env[0] ?? "its API key";
+        return json(
+          { error: `${template.name} needs an API key. Paste one here, or set ${env} and restart Wandey.` },
+          400,
+        );
+      }
+      if (kind !== "openai") {
+        return json(
+          { error: `${name} needs an API key for the ${kind === "anthropic" ? "Anthropic" : "Gemini"} API format.` },
+          400,
+        );
+      }
+    }
+
+    config.providers[id] = cfg;
+    try {
+      saveConfig({ providers: { [id]: cfg } }, paths);
+    } catch (err) {
+      if (existing) config.providers[id] = existing;
+      else delete config.providers[id];
+      return json({ error: `Could not save the provider: ${(err as Error).message}` }, 500);
+    }
+
+    registry.reload(config);
+    const models = await registry.listModels(true);
+    const providers = await registry.statusesWithModels();
+    return json(
+      {
+        id,
+        provider: providers.find((entry) => entry.id === id) ?? null,
+        models,
+        providers,
+        catalog: registry.catalog(),
+      },
+      201,
+    );
+  }
+
+  async function disconnectProvider(rawID: string): Promise<Response> {
+    const id = rawID.toLowerCase();
+    if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(id)) {
+      return json({ error: "Invalid provider id." }, 400);
+    }
+    const existing = config.providers[id];
+    const template = templateFor(id);
+    const known = existing || template || registry.catalog().some((entry) => entry.id === id);
+    if (!known) return json({ error: "Provider not found." }, 404);
+
+    // Keep enough information to reconnect later, but remove credentials and
+    // authorization headers. A disconnect should not leave a secret on disk.
+    const disabled: ProviderConfig = {
+      enabled: false,
+      ...(existing?.kind || template?.kind ? { kind: existing?.kind ?? template?.kind } : {}),
+      ...(existing?.name || template?.name ? { name: existing?.name ?? template?.name } : {}),
+      ...(existing?.baseUrl || template?.baseUrl ? { baseUrl: existing?.baseUrl ?? template?.baseUrl } : {}),
+      ...(existing?.local ?? template?.local ? { local: existing?.local ?? template?.local } : {}),
+      ...(existing?.models?.length ? { models: [...existing.models] } : {}),
+      ...(existing?.description ? { description: existing.description } : {}),
+    };
+    config.providers[id] = disabled;
+    try {
+      saveConfig({ providers: { [id]: disabled } }, paths);
+    } catch (err) {
+      if (existing) config.providers[id] = existing;
+      else delete config.providers[id];
+      return json({ error: `Could not update the provider: ${(err as Error).message}` }, 500);
+    }
+
+    registry.reload(config);
+    await registry.listModels(true);
+    return json({
+      ok: true,
+      providers: await registry.statusesWithModels(),
+      catalog: registry.catalog(),
+    });
+  }
+
   const server = Bun.serve<SocketData, never>({
     hostname: options.host ?? config.server.host,
     port: options.port ?? config.server.port,
@@ -121,7 +276,34 @@ export async function startServer(options: ServerOptions): Promise<WandeyServer>
         }
 
         if (pathname === "/api/providers") {
-          return json({ providers: await registry.statusesWithModels() });
+          if (req.method === "GET") {
+            await registry.listModels();
+            return json({
+              providers: await registry.statusesWithModels(),
+              catalog: registry.catalog(),
+              configFile: paths.configFile,
+              opencode: config.integrations.opencode,
+            });
+          }
+          if (req.method === "POST") {
+            const body = await readBody<ProviderUpsertBody>(req);
+            return await upsertProvider(body);
+          }
+          return json({ error: "Method not allowed" }, 405);
+        }
+
+        if (pathname === "/api/providers/refresh" && req.method === "POST") {
+          const models = await registry.listModels(true);
+          return json({
+            models,
+            providers: await registry.statusesWithModels(),
+            catalog: registry.catalog(),
+          });
+        }
+
+        const providerMatch = pathname.match(/^\/api\/providers\/([^/]+)$/);
+        if (providerMatch && req.method === "DELETE") {
+          return await disconnectProvider(decodeURIComponent(providerMatch[1]!));
         }
 
         if (pathname === "/api/config") {
@@ -359,6 +541,24 @@ async function readBody<T>(req: Request): Promise<T> {
     return (await req.json()) as T;
   } catch {
     return {} as T;
+  }
+}
+
+function slugProviderID(name: string): string {
+  return name
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48);
+}
+
+function isLocalEndpoint(baseUrl: string): boolean {
+  try {
+    const host = new URL(baseUrl).hostname.toLowerCase();
+    return host === "localhost" || host === "127.0.0.1" || host === "::1" || host.endsWith(".local");
+  } catch {
+    return false;
   }
 }
 

@@ -16,8 +16,38 @@ export interface ProviderStatus {
   authenticated: boolean;
   local: boolean;
   source: "config" | "env" | "local" | "opencode";
+  /** Where the provider record came from. Auto-local servers stay available. */
+  auto?: "env" | "local" | "opencode";
   modelCount: number;
+  /** Curated fallback model ids from config, if any. */
+  models?: string[];
   error?: string;
+}
+
+export interface ProviderCatalogEntry {
+  id: string;
+  name: string;
+  kind: string;
+  description: string;
+  local: boolean;
+  configured: boolean;
+  /** True when the provider answered and returned at least one model. */
+  connected: boolean;
+  authenticated: boolean;
+  /** True when Wandey has a key for this provider, whether saved or from the environment. */
+  keyStored: boolean;
+  source?: ProviderStatus["source"];
+  /** True for a user-added endpoint with no catalog template. */
+  custom: boolean;
+  /** Disconnected providers remain visible so they can be re-enabled. */
+  disabled: boolean;
+  auto?: ProviderStatus["auto"];
+  baseUrl?: string;
+  modelCount: number;
+  models?: string[];
+  error?: string;
+  env: string[];
+  docs?: string;
 }
 
 interface Resolved {
@@ -37,13 +67,26 @@ export class ProviderRegistry {
   private adapters = new Map<string, ProviderAdapter>();
   private statuses = new Map<string, ProviderStatus>();
   private cache: { at: number; models: ModelInfo[] } | null = null;
-  private readonly config: Config;
+  private config: Config;
+  private readonly importOpenCode: boolean;
 
   constructor(config: Config, options: { importOpenCode?: boolean } = {}) {
     this.config = structuredClone(config);
-    if (options.importOpenCode ?? config.integrations.opencode) {
-      this.mergeOpenCode();
-    }
+    this.importOpenCode = options.importOpenCode ?? config.integrations.opencode;
+    this.reset();
+  }
+
+  /** Re-read providers after a connection is added, edited, or removed. */
+  reload(config: Config): void {
+    this.config = structuredClone(config);
+    this.reset();
+  }
+
+  private reset(): void {
+    this.adapters.clear();
+    this.statuses.clear();
+    this.cache = null;
+    if (this.importOpenCode) this.mergeOpenCode();
     this.build();
   }
 
@@ -81,7 +124,7 @@ export class ProviderRegistry {
       const isLocal = Boolean(cfg.local || template?.local);
       // A remote provider with no key can't do anything useful. A custom
       // baseUrl is an explicit invitation to try, even without a key.
-      if (kind !== "openai" && !apiKey) continue;
+      if (kind !== "openai" && !apiKey && !isLocal) continue;
       if (kind === "openai" && !apiKey && !isLocal && !cfg.baseUrl) continue;
       if (!baseUrl) continue;
 
@@ -90,7 +133,7 @@ export class ProviderRegistry {
         adapter = new AnthropicProvider({
           id,
           baseUrl,
-          apiKey: apiKey!,
+          apiKey: apiKey ?? "",
           headers: cfg.headers,
           models: cfg.models,
         });
@@ -98,7 +141,7 @@ export class ProviderRegistry {
         adapter = new GeminiProvider({
           id,
           baseUrl,
-          apiKey: apiKey!,
+          apiKey: apiKey ?? "",
           models: cfg.models,
         });
       } else {
@@ -122,7 +165,9 @@ export class ProviderRegistry {
         authenticated: Boolean(apiKey) || isLocal,
         local: isLocal,
         source: cfg.auto === "env" ? "env" : cfg.auto === "opencode" ? "opencode" : isLocal ? "local" : "config",
+        auto: cfg.auto,
         modelCount: 0,
+        models: cfg.models?.length ? [...cfg.models] : undefined,
       });
     }
   }
@@ -155,7 +200,10 @@ export class ProviderRegistry {
       const [id] = entries[index]!;
       const status = this.statuses.get(id);
       if (result.status === "rejected") {
-        if (status) status.error = (result.reason as Error)?.message ?? String(result.reason);
+        if (status) {
+          status.error = (result.reason as Error)?.message ?? String(result.reason);
+          status.modelCount = 0;
+        }
         return;
       }
       if (status) {
@@ -228,15 +276,71 @@ export class ProviderRegistry {
     return [...this.statuses.values()];
   }
 
-  catalog(): Array<{ id: string; name: string; kind: string; description: string; local: boolean; configured: boolean }> {
-    return Object.values(PROVIDER_TEMPLATES).map((template) => ({
-      id: template.id,
-      name: template.name,
-      kind: template.kind,
-      description: template.description,
-      local: Boolean(template.local),
-      configured: this.adapters.has(template.id),
-    }));
+  catalog(): ProviderCatalogEntry[] {
+    const entries = new Map<string, ProviderCatalogEntry>();
+    for (const template of Object.values(PROVIDER_TEMPLATES)) {
+      const raw = this.config.providers[template.id];
+      const cfg = raw ? resolveProviderConfig(template.id, raw) : undefined;
+      const status = this.statuses.get(template.id);
+      const disabled = raw?.enabled === false;
+      const local = Boolean(status?.local ?? cfg?.local ?? template.local);
+      const apiKey = cfg ? getApiKey(template.id, cfg) : null;
+      entries.set(template.id, {
+        id: template.id,
+        name: status?.name ?? cfg?.name ?? template.name,
+        kind: status?.kind ?? cfg?.kind ?? template.kind,
+        description: cfg?.description ?? template.description,
+        local,
+        configured: Boolean(status || raw),
+        connected: Boolean(status && status.modelCount > 0),
+        authenticated: status?.authenticated ?? Boolean(apiKey || local),
+        keyStored: Boolean(apiKey),
+        source: status?.source ?? (raw?.auto === "env" ? "env" : raw?.auto === "opencode" ? "opencode" : "config"),
+        custom: false,
+        disabled,
+        auto: status?.auto ?? cfg?.auto,
+        baseUrl: status?.baseUrl ?? cfg?.baseUrl ?? template.baseUrl,
+        modelCount: status?.modelCount ?? 0,
+        models: status?.models ?? cfg?.models,
+        error: status?.error,
+        env: template.env,
+        docs: template.docs,
+      });
+    }
+
+    // Keep user-added endpoints, including disconnected ones, visible so they
+    // can be edited or reconnected later. A disabled provider has no status.
+    const customIDs = new Set([...Object.keys(this.config.providers), ...this.statuses.keys()]);
+    for (const id of customIDs) {
+      if (templateFor(id)) continue;
+      const raw = this.config.providers[id];
+      const cfg = raw ? resolveProviderConfig(id, raw) : undefined;
+      const status = this.statuses.get(id);
+      if (!status && !raw) continue;
+      const local = Boolean(status?.local ?? cfg?.local);
+      const apiKey = cfg ? getApiKey(id, cfg) : null;
+      entries.set(id, {
+        id,
+        name: status?.name ?? cfg?.name ?? id,
+        kind: status?.kind ?? cfg?.kind ?? "openai",
+        description: cfg?.description ?? "Custom endpoint",
+        local,
+        configured: Boolean(status || raw),
+        connected: Boolean(status && status.modelCount > 0),
+        authenticated: status?.authenticated ?? Boolean(apiKey || local),
+        keyStored: Boolean(apiKey),
+        source: status?.source ?? "config",
+        custom: true,
+        disabled: raw?.enabled === false,
+        auto: status?.auto ?? cfg?.auto,
+        baseUrl: status?.baseUrl ?? cfg?.baseUrl,
+        modelCount: status?.modelCount ?? 0,
+        models: status?.models ?? cfg?.models,
+        error: status?.error,
+        env: [],
+      });
+    }
+    return [...entries.values()];
   }
 
   modelConfig(ref: string): { contextWindow?: number; maxOutput?: number } {
