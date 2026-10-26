@@ -213,6 +213,27 @@ export async function startServer(options: ServerOptions): Promise<WandeyServer>
     );
   }
 
+  async function setOpenCodeLocal(enabled: boolean): Promise<Response> {
+    const previous = config.integrations.opencodeLocal;
+    config.integrations.opencodeLocal = enabled;
+    try {
+      saveConfig({ integrations: { ...config.integrations, opencodeLocal: enabled } }, paths);
+    } catch (err) {
+      config.integrations.opencodeLocal = previous;
+      return json({ error: `Could not save the integration: ${(err as Error).message}` }, 500);
+    }
+
+    registry.reload(config);
+    const models = await registry.listModels(true);
+    return json({
+      enabled,
+      opencodeLocal: enabled,
+      models,
+      providers: await registry.statusesWithModels(),
+      catalog: registry.catalog(),
+    });
+  }
+
   async function disconnectProvider(rawID: string): Promise<Response> {
     const id = rawID.toLowerCase();
     if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(id)) {
@@ -283,6 +304,7 @@ export async function startServer(options: ServerOptions): Promise<WandeyServer>
               catalog: registry.catalog(),
               configFile: paths.configFile,
               opencode: config.integrations.opencode,
+              opencodeLocal: config.integrations.opencodeLocal,
             });
           }
           if (req.method === "POST") {
@@ -290,6 +312,11 @@ export async function startServer(options: ServerOptions): Promise<WandeyServer>
             return await upsertProvider(body);
           }
           return json({ error: "Method not allowed" }, 405);
+        }
+
+        if (pathname === "/api/integrations/opencode-local" && req.method === "POST") {
+          const body = await readBody<{ enabled?: boolean }>(req);
+          return await setOpenCodeLocal(Boolean(body.enabled));
         }
 
         if (pathname === "/api/providers/refresh" && req.method === "POST") {
@@ -505,6 +532,7 @@ export async function startServer(options: ServerOptions): Promise<WandeyServer>
     registry,
     stop() {
       agent.abortAll();
+      registry.stop();
       store.recoverInterruptedResearchJobs("Interrupted by a server shutdown. Resume it to continue.");
       server.stop(true);
       store.close();

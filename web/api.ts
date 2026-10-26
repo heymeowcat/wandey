@@ -51,6 +51,7 @@ export interface ProvidersResponse {
   catalog: ProviderCatalogEntry[];
   configFile: string;
   opencode: boolean;
+  opencodeLocal: boolean;
 }
 
 export interface ProviderMutationResponse {
@@ -59,6 +60,11 @@ export interface ProviderMutationResponse {
   models: ModelInfo[];
   providers: ProviderInfo[];
   catalog: ProviderCatalogEntry[];
+}
+
+export interface ProviderIntegrationResponse extends ProviderMutationResponse {
+  enabled: boolean;
+  opencodeLocal: boolean;
 }
 
 export interface ProviderUpsert {
@@ -129,6 +135,12 @@ export const api = {
       "/api/providers/refresh",
       { method: "POST" },
     ),
+
+  setOpenCodeLocal: (enabled: boolean) =>
+    request<ProviderIntegrationResponse>("/api/integrations/opencode-local", {
+      method: "POST",
+      body: JSON.stringify({ enabled }),
+    }),
 
   sessions: () => request<{ sessions: Session[] }>("/api/sessions"),
 

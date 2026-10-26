@@ -1,4 +1,4 @@
-import type { ProviderCatalogEntry, ProvidersResponse, ProviderUpsert } from "./api.ts";
+import type { ProviderCatalogEntry, ProviderInfo, ProvidersResponse, ProviderUpsert } from "./api.ts";
 import { api } from "./api.ts";
 import { clear, el, openModal, showToast, type ModalHandle } from "./components.ts";
 import { icon } from "./icons.ts";
@@ -92,6 +92,9 @@ export function openProviderModal(options: ProviderModalOptions): ModalHandle {
   function renderList(): void {
     if (!snapshot) return;
     const catalog = snapshot.catalog;
+    const opencodeLocalStatus = snapshot.providers.find((entry) => entry.id === "opencode-local");
+    const opencodeLocalReady =
+      snapshot.opencodeLocal && (opencodeLocalStatus?.modelCount ?? 0) > 0;
     const connected = catalog.filter((entry) => entry.connected);
     const disconnected = catalog.filter((entry) => entry.disabled);
     // Auto-discovered local servers are simply not running yet; that is not a
@@ -104,18 +107,21 @@ export function openProviderModal(options: ProviderModalOptions): ModalHandle {
     );
     const localAvailable = available.filter((entry) => entry.local);
     const cloudAvailable = available.filter((entry) => !entry.local);
-    const modelCount = connected.reduce((sum, entry) => sum + entry.modelCount, 0);
+    const readyCount = connected.length + (opencodeLocalReady ? 1 : 0);
+    const modelCount =
+      connected.reduce((sum, entry) => sum + entry.modelCount, 0) +
+      (opencodeLocalReady ? (opencodeLocalStatus?.modelCount ?? 0) : 0);
 
     const root = el("div", { class: "providers-view" });
     const summary = el("div", { class: "providers-summary" });
     const summaryCopy = el("div", { class: "providers-summary-copy" });
     summaryCopy.append(
-      el("strong", { text: connected.length === 0 ? "No providers ready" : `${connected.length} provider${connected.length === 1 ? "" : "s"} ready` }),
+      el("strong", { text: readyCount === 0 ? "No providers ready" : `${readyCount} provider${readyCount === 1 ? "" : "s"} ready` }),
     );
     summaryCopy.append(
       el("span", {
         text:
-          connected.length === 0
+          readyCount === 0
             ? "Connect a cloud API or start a local model server to begin."
             : `${modelCount} models available across your connections.`,
       }),
@@ -132,7 +138,7 @@ export function openProviderModal(options: ProviderModalOptions): ModalHandle {
     summary.append(refresh);
     root.append(summary);
 
-    if (connected.length === 0 && attention.length === 0 && disconnected.length === 0) {
+    if (readyCount === 0 && attention.length === 0 && disconnected.length === 0) {
       const guide = el("div", { class: "provider-guide" });
       const mark = el("div", { class: "provider-guide-mark" });
       mark.append(icon("key", 20));
@@ -141,7 +147,7 @@ export function openProviderModal(options: ProviderModalOptions): ModalHandle {
       copy.append(el("h3", { text: "Start with one connection" }));
       copy.append(
         el("p", {
-          text: "Cloud providers need an API key. Ollama, LM Studio, llama.cpp, and vLLM only need to be running on this machine.",
+          text: "Cloud providers need an API key. Local servers only need to be running. Or enable the OpenCode local runtime for free models.",
         }),
       );
       guide.append(copy);
@@ -175,6 +181,11 @@ export function openProviderModal(options: ProviderModalOptions): ModalHandle {
       for (const entry of localAvailable) grid.append(providerCard(entry));
       root.append(grid);
     }
+
+    root.append(section("Local runtime", "Optional integrations that run through software already on this machine."));
+    const runtimeGrid = el("div", { class: "provider-grid" });
+    runtimeGrid.append(opencodeLocalCard(opencodeLocalStatus));
+    root.append(runtimeGrid);
 
     if (cloudAvailable.length > 0) {
       root.append(section("Cloud providers", "Bring a key from the provider. It stays on this machine."));
@@ -252,8 +263,105 @@ export function openProviderModal(options: ProviderModalOptions): ModalHandle {
     if (entry.local) badges.push({ label: "Local", class: "badge-local" });
     if (entry.source === "env") badges.push({ label: "Environment", class: "badge-soft" });
     if (entry.source === "opencode") badges.push({ label: "OpenCode", class: "badge-soft" });
+    if (entry.source === "opencode-local") badges.push({ label: "OpenCode local", class: "badge-soft" });
     if (entry.auto === "local" && !entry.connected) badges.push({ label: "Not running", class: "badge-soft" });
     return badges;
+  }
+
+  function opencodeLocalCard(status?: ProviderInfo): HTMLElement {
+    if (!snapshot) return el("div", {});
+    const enabled = snapshot.opencodeLocal;
+    const ready = enabled && (status?.modelCount ?? 0) > 0;
+    const card = el("article", {
+      class: `provider-card${ready ? " provider-ready" : enabled ? " provider-attention" : ""}`,
+    });
+
+    const top = el("div", { class: "provider-card-top" });
+    const mark = el("span", { class: "provider-mark provider-mark-large", "aria-hidden": "true" });
+    mark.style.setProperty("--provider-hue", providerHue("opencode-local"));
+    mark.textContent = "O";
+    top.append(mark);
+
+    const titles = el("div", { class: "provider-card-titles" });
+    const titleRow = el("div", { class: "provider-title-row" });
+    titleRow.append(el("h3", { text: "OpenCode local" }));
+    titleRow.append(el("span", { class: "provider-badge badge-local", text: "Local" }));
+    titleRow.append(el("span", { class: "provider-badge badge-soft", text: "Free models" }));
+    titleRow.append(el("span", { class: "provider-badge badge-soft", text: "Text only" }));
+    titles.append(titleRow);
+    titles.append(
+      el("p", {
+        class: "provider-description",
+        text: enabled
+          ? "Free models through the OpenCode CLI. Isolated from your project and text-only."
+          : "Use OpenCode's free models through the local CLI. Opt-in, isolated, and text-only.",
+      }),
+    );
+    top.append(titles);
+
+    const action = el("button", {
+      class: `button button-small provider-integration-toggle${enabled ? " button-ghost" : " button-primary"}`,
+      type: "button",
+      disabled: busy,
+      text: busy ? "Updating…" : enabled ? "Disable" : "Enable",
+    });
+    action.addEventListener("click", () => void toggleOpenCodeLocal(!enabled));
+    top.append(action);
+    card.append(top);
+
+    const meta = el("div", { class: "provider-card-meta" });
+    if (enabled) {
+      const count = status?.modelCount ?? 0;
+      meta.append(el("span", { class: "provider-count", text: `${count} model${count === 1 ? "" : "s"}` }));
+    }
+    meta.append(el("span", { text: enabled ? "local runtime" : "opt-in" }));
+    card.append(meta);
+
+    if (status?.error) {
+      const error = el("div", { class: "provider-error" });
+      const message = status.error.length > 240 ? `${status.error.slice(0, 240)}…` : status.error;
+      error.append(icon("alert", 14), el("span", { text: message }));
+      card.append(error);
+    }
+
+    return card;
+  }
+
+  async function toggleOpenCodeLocal(enabled: boolean): Promise<void> {
+    if (busy) return;
+    busy = true;
+    render();
+    try {
+      const result = await api.setOpenCodeLocal(enabled);
+      if (snapshot) {
+        snapshot.providers = result.providers;
+        snapshot.catalog = result.catalog;
+        snapshot.opencodeLocal = result.enabled;
+      }
+      await options.onChange();
+      const status = result.providers.find((entry) => entry.id === "opencode-local");
+      const count = status?.modelCount ?? 0;
+      if (enabled && count === 0) {
+        showToast(
+          "info",
+          status?.error
+            ? `OpenCode local is enabled, but the runtime is not ready: ${status.error}`
+            : "OpenCode local is enabled, but no free models are available yet.",
+        );
+      } else {
+        showToast(
+          enabled ? "success" : "info",
+          enabled ? `OpenCode local enabled · ${count} free model${count === 1 ? "" : "s"}` : "OpenCode local disabled",
+        );
+      }
+      busy = false;
+      focusAfterRender = ".provider-integration-toggle";
+      render();
+    } catch (err) {
+      busy = false;
+      showToast("error", `Could not update OpenCode local: ${(err as Error).message}`);
+      render();
+    }
   }
 
   function openForm(entry?: ProviderCatalogEntry, custom = false): void {
@@ -741,6 +849,8 @@ function sourceLabel(entry: ProviderCatalogEntry): string {
       return "from environment";
     case "opencode":
       return "from OpenCode";
+    case "opencode-local":
+      return "local runtime";
     case "local":
       return "local discovery";
     case "config":

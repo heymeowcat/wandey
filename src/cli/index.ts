@@ -138,6 +138,8 @@ async function serve(argv: string[]): Promise<void> {
   const { config, paths } = loadConfig();
   if (flag(args, "model")) config.agent.model = flag(args, "model")!;
   if (has(args, "no-opencode")) config.integrations.opencode = false;
+  if (has(args, "opencode-local")) config.integrations.opencodeLocal = true;
+  if (has(args, "no-opencode-local")) config.integrations.opencodeLocal = false;
   if (has(args, "no-open")) config.server.openBrowser = false;
 
   const host = flag(args, "host") ?? config.server.host;
@@ -194,6 +196,8 @@ async function chat(argv: string[]): Promise<void> {
   const requestedModel = flag(args, "model") ?? "";
   if (requestedModel) config.agent.model = requestedModel;
   if (has(args, "no-opencode")) config.integrations.opencode = false;
+  if (has(args, "opencode-local")) config.integrations.opencodeLocal = true;
+  if (has(args, "no-opencode-local")) config.integrations.opencodeLocal = false;
   ensurePaths(paths);
 
   const store = new Store(paths.dbFile);
@@ -221,6 +225,7 @@ async function chat(argv: string[]): Promise<void> {
       });
     }
   } catch (err) {
+    registry.stop();
     store.close();
     throw err;
   }
@@ -240,6 +245,7 @@ async function chat(argv: string[]): Promise<void> {
       red("No model is available.") +
         dim(" Start Ollama, add an API key, or run `wandey models` after configuring a provider."),
     );
+    registry.stop();
     store.close();
     process.exitCode = 1;
     return;
@@ -507,10 +513,12 @@ async function chat(argv: string[]): Promise<void> {
         const next = rest.join(" ").trim();
         if (!next) {
           console.log(`${dim("model")} ${cyan(model)}`);
-          const options = (await registry.listModels()).filter((entry) => entry.supportsTools !== false).slice(0, 12);
+          const options = (await registry.listModels()).slice(0, 12);
           if (options.length > 0) {
             console.log(dim("some available models"));
-            for (const option of options) console.log(`  ${option.ref}`);
+            for (const option of options) {
+              console.log(`  ${option.ref}${option.supportsTools === false ? dim(" (no tools)") : ""}`);
+            }
           }
           continue;
         }
@@ -569,6 +577,7 @@ async function chat(argv: string[]): Promise<void> {
 
   if (activeRun && agent.isRunning(session.id)) agent.abort(session.id);
   rl.close();
+  registry.stop();
   store.close();
 }
 
@@ -579,63 +588,78 @@ async function chat(argv: string[]): Promise<void> {
 async function models(argv: string[]): Promise<void> {
   const args = parseArgs(argv);
   if (has(args, "help")) {
-    console.log("Usage: wandey models [--provider <id>] [--free] [--all] [--limit <n>] [--json]");
+    console.log(
+      "Usage: wandey models [--provider <id>] [--free] [--all] [--limit <n>] [--json] [--opencode-local] [--no-opencode-local]",
+    );
     return;
   }
   const { config, paths } = loadConfig();
+  if (has(args, "opencode-local")) config.integrations.opencodeLocal = true;
+  if (has(args, "no-opencode-local")) config.integrations.opencodeLocal = false;
   const registry = new ProviderRegistry(config);
-  const refresh = has(args, "refresh");
-  const all = has(args, "all");
-  const limit = Number(flag(args, "limit") ?? "20");
-  const providerFilter = flag(args, "provider");
-  const freeOnly = has(args, "free");
-  const [allModels, providers] = await Promise.all([
-    registry.listModels(refresh),
-    registry.statusesWithModels(),
-  ]);
+  try {
+    const refresh = has(args, "refresh");
+    const all = has(args, "all");
+    const limit = Number(flag(args, "limit") ?? "20");
+    const providerFilter = flag(args, "provider");
+    const freeOnly = has(args, "free");
+    const [allModels, providers] = await Promise.all([
+      registry.listModels(refresh),
+      registry.statusesWithModels(),
+    ]);
 
-  let shown = allModels;
-  if (providerFilter) shown = shown.filter((model) => model.provider === providerFilter);
-  if (freeOnly) shown = shown.filter((model) => model.free);
+    let shown = allModels;
+    if (providerFilter) shown = shown.filter((model) => model.provider === providerFilter);
+    if (freeOnly) shown = shown.filter((model) => model.free);
 
-  if (has(args, "json")) {
-    console.log(JSON.stringify({ providers, models: shown }, null, 2));
-    return;
-  }
-
-  console.log(`${bold("models")} ${dim(`${shown.length} of ${allModels.length} · ${paths.configFile}`)}`);
-  if (shown.length === 0) {
-    console.log("");
-    console.log(yellow("No models found."));
-    console.log(dim("Start Ollama, set OPENROUTER_API_KEY, or add a provider in `wandey config`."));
-    return;
-  }
-
-  const groups = new Map<string, typeof shown>();
-  for (const model of shown) {
-    const group = groups.get(model.provider) ?? [];
-    group.push(model);
-    groups.set(model.provider, group);
-  }
-
-  for (const [providerID, group] of groups) {
-    const status = providers.find((entry) => entry.id === providerID);
-    const scope = status?.local ? "local" : status?.source === "opencode" ? "opencode" : "remote";
-    console.log("");
-    console.log(`${bold(status?.name ?? providerID)} ${dim(`· ${scope} · ${group.length} model${group.length === 1 ? "" : "s"}`)}`);
-    if (status?.error) console.log(dim(`  ${status.error}`));
-    const visible = all ? group : group.slice(0, Number.isFinite(limit) ? Math.max(1, limit) : group.length);
-    for (const model of visible) {
-      const tags = [model.free ? green("free") : "", model.supportsTools === false ? dim("no-tools") : ""]
-        .filter(Boolean)
-        .join(" ");
-      const context = model.contextWindow ? dim(` ${compact(model.contextWindow)} ctx`) : "";
-      console.log(`  ${cyan(model.ref)}`);
-      console.log(`    ${model.name}${context}${tags ? ` ${tags}` : ""}`);
+    if (has(args, "json")) {
+      console.log(JSON.stringify({ providers, models: shown }, null, 2));
+      return;
     }
-    if (visible.length < group.length) {
-      console.log(dim(`  … ${group.length - visible.length} more (use --all or --limit)`));
+
+    console.log(`${bold("models")} ${dim(`${shown.length} of ${allModels.length} · ${paths.configFile}`)}`);
+    if (shown.length === 0) {
+      console.log("");
+      console.log(yellow("No models found."));
+      console.log(dim("Start Ollama, set OPENROUTER_API_KEY, or add a provider in `wandey config`."));
+      return;
     }
+
+    const groups = new Map<string, typeof shown>();
+    for (const model of shown) {
+      const group = groups.get(model.provider) ?? [];
+      group.push(model);
+      groups.set(model.provider, group);
+    }
+
+    for (const [providerID, group] of groups) {
+      const status = providers.find((entry) => entry.id === providerID);
+      const scope =
+        status?.source === "opencode-local"
+          ? "opencode local"
+          : status?.local
+            ? "local"
+            : status?.source === "opencode"
+              ? "opencode"
+              : "remote";
+      console.log("");
+      console.log(`${bold(status?.name ?? providerID)} ${dim(`· ${scope} · ${group.length} model${group.length === 1 ? "" : "s"}`)}`);
+      if (status?.error) console.log(dim(`  ${status.error}`));
+      const visible = all ? group : group.slice(0, Number.isFinite(limit) ? Math.max(1, limit) : group.length);
+      for (const model of visible) {
+        const tags = [model.free ? green("free") : "", model.supportsTools === false ? dim("no-tools") : ""]
+          .filter(Boolean)
+          .join(" ");
+        const context = model.contextWindow ? dim(` ${compact(model.contextWindow)} ctx`) : "";
+        console.log(`  ${cyan(model.ref)}`);
+        console.log(`    ${model.name}${context}${tags ? ` ${tags}` : ""}`);
+      }
+      if (visible.length < group.length) {
+        console.log(dim(`  … ${group.length - visible.length} more (use --all or --limit)`));
+      }
+    }
+  } finally {
+    registry.stop();
   }
 }
 
@@ -687,6 +711,7 @@ async function doctor(argv: string[]): Promise<void> {
       if (provider.error) warnings.push(`${provider.id}: ${provider.error}`);
     }
   } catch (err) {
+    registry?.stop();
     add("providers", "fail", (err as Error).message);
   }
 
@@ -715,6 +740,14 @@ async function doctor(argv: string[]): Promise<void> {
     config.crawl.render.backend === "none" ? "none (HTTP + Readability)" : config.crawl.render.backend,
   );
   add("opencode", "ok", config.integrations.opencode ? "credential import enabled" : "disabled");
+  const openCodeBinary = Bun.which("opencode");
+  if (!config.integrations.opencodeLocal) {
+    add("opencode-local", "ok", "disabled");
+  } else if (openCodeBinary) {
+    add("opencode-local", "ok", `enabled · ${openCodeBinary}`);
+  } else {
+    add("opencode-local", "warn", "enabled, but the opencode CLI is not on PATH");
+  }
 
   if (has(args, "json")) {
     console.log(
@@ -736,6 +769,7 @@ async function doctor(argv: string[]): Promise<void> {
         2,
       ),
     );
+    registry?.stop();
     store?.close();
     process.exitCode = problems.length > 0 ? 1 : 0;
     return;
@@ -754,7 +788,14 @@ async function doctor(argv: string[]): Promise<void> {
     console.log(bold("providers"));
     for (const provider of providerStatuses) {
       const mark = provider.modelCount > 0 ? green("✓") : dim("·");
-      const auth = provider.authenticated ? "auth" : provider.local ? "local" : "no-key";
+      const auth =
+        provider.source === "opencode-local"
+          ? "local runtime"
+          : provider.authenticated
+            ? "auth"
+            : provider.local
+              ? "local"
+              : "no-key";
       const error = provider.error ? ` ${red(provider.error)}` : "";
       console.log(`  ${mark} ${provider.id.padEnd(14)} ${String(provider.modelCount).padStart(4)} models  ${dim(auth)}${error}`);
     }
@@ -774,6 +815,7 @@ async function doctor(argv: string[]): Promise<void> {
     console.log(green("All critical checks passed."));
   }
   console.log(dim(`\nconfig ${paths.configFile}`));
+  registry?.stop();
   store?.close();
   process.exitCode = problems.length > 0 ? 1 : 0;
 }
@@ -888,6 +930,7 @@ function printHelp(): void {
   console.log("  wandey serve --port 4319 --no-open");
   console.log("  wandey chat --model openrouter/google/gemma-4-31b-it:free");
   console.log("  wandey chat --research");
+  console.log("  wandey chat --opencode-local --model opencode-local/big-pickle");
   console.log("  wandey models --free");
   console.log("");
   console.log(dim("Run `wandey <command> --help` for command options."));
@@ -902,6 +945,8 @@ function printServeHelp(): void {
   console.log("  --no-open    do not open a browser");
   console.log("  --dev        rebuild the browser bundle on request");
   console.log("  --no-opencode  skip importing OpenCode credentials");
+  console.log("  --opencode-local  enable OpenCode free models through the local CLI");
+  console.log("  --no-opencode-local  disable the local OpenCode backend");
 }
 
 function printChatHelp(): void {
@@ -913,6 +958,8 @@ function printChatHelp(): void {
   console.log("  --session    resume a session by id");
   console.log("  --continue   resume the most recent session");
   console.log("  --reasoning  stream reasoning text");
+  console.log("  --opencode-local  enable OpenCode free models through the local CLI");
+  console.log("  --no-opencode-local  disable the local OpenCode backend");
 }
 
 function printConfigHelp(): void {
