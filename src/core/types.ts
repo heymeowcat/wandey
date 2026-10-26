@@ -141,6 +141,10 @@ export interface ProviderAdapter {
   authenticated: boolean;
   listModels(): Promise<ModelInfo[]>;
   stream(req: ChatRequest): AsyncGenerator<ProviderEvent, void, unknown>;
+  /** Some local runtimes expose text-only models. Defaults to true. */
+  supportsTools?(model: string): boolean | Promise<boolean>;
+  /** Release long-lived resources such as child processes. */
+  dispose?(): void;
 }
 
 export type ProviderKind = "openai" | "anthropic" | "gemini" | "opencode";

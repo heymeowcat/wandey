@@ -46,6 +46,15 @@ describe("mergeConfig", () => {
     });
     expect(merged.search.providers).toEqual([{ type: "brave" }]);
   });
+
+  test("keeps the local OpenCode backend opt-in", () => {
+    expect(DEFAULTS.integrations.opencodeLocal).toBe(false);
+    const merged = mergeConfig(DEFAULTS, {
+      integrations: { ...DEFAULTS.integrations, opencodeLocal: true },
+    });
+    expect(merged.integrations.opencodeLocal).toBe(true);
+    expect(merged.integrations.opencode).toBe(true);
+  });
 });
 
 describe("resolvePaths and WANDEY_HOME", () => {

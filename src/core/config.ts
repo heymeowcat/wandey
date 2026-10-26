@@ -108,6 +108,8 @@ export interface Config {
   integrations: {
     /** Reuse provider credentials that OpenCode already has on this machine. */
     opencode: boolean;
+    /** Opt in to running anonymous OpenCode free models through the local CLI. */
+    opencodeLocal: boolean;
   };
   search: {
     providers: SearchProviderConfig[];
@@ -163,6 +165,7 @@ export const DEFAULTS: Config = {
   },
   integrations: {
     opencode: true,
+    opencodeLocal: false,
   },
   search: {
     providers: [

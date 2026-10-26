@@ -243,6 +243,7 @@ export class Agent {
       return;
     }
 
+    const canUseTools = await registry.supportsTools(model);
     let finalised = false;
     try {
       for (let step = 0; step < config.agent.maxSteps; step++) {
@@ -253,6 +254,7 @@ export class Agent {
           config,
           session: store.getSession(sessionID) ?? session,
           tools,
+          toolsEnabled: canUseTools,
           trimmedNote: history.note,
           model,
         });
@@ -302,7 +304,7 @@ export class Agent {
           for await (const event of registry.stream(model, {
             system,
             messages: history.messages,
-            tools: tools.schemas(),
+            tools: canUseTools ? tools.schemas() : [],
             temperature: config.agent.temperature,
             signal: controller.signal,
           })) {

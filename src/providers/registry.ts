@@ -5,6 +5,7 @@ import { PROVIDER_TEMPLATES, templateFor } from "./catalog.ts";
 import { AnthropicProvider } from "./anthropic.ts";
 import { GeminiProvider } from "./gemini.ts";
 import { OpenAIProvider } from "./openai.ts";
+import { OpenCodeLocalProvider, OPENCODE_LOCAL_PROVIDER_ID } from "./opencode-local.ts";
 import { openCodeProviderConfigs } from "../integrations/opencode.ts";
 import { parseModelRef } from "../core/util.ts";
 
@@ -15,7 +16,7 @@ export interface ProviderStatus {
   baseUrl?: string;
   authenticated: boolean;
   local: boolean;
-  source: "config" | "env" | "local" | "opencode";
+  source: "config" | "env" | "local" | "opencode" | "opencode-local";
   /** Where the provider record came from. Auto-local servers stay available. */
   auto?: "env" | "local" | "opencode";
   modelCount: number;
@@ -83,11 +84,30 @@ export class ProviderRegistry {
   }
 
   private reset(): void {
+    for (const adapter of this.adapters.values()) adapter.dispose?.();
     this.adapters.clear();
     this.statuses.clear();
     this.cache = null;
     if (this.importOpenCode) this.mergeOpenCode();
     this.build();
+    // This is an integration, not a provider record. Keep it out of the
+    // provider CRUD catalog while still exposing its models to the picker.
+    if (this.config.integrations.opencodeLocal) this.addOpenCodeLocal();
+  }
+
+  private addOpenCodeLocal(): void {
+    const adapter = new OpenCodeLocalProvider();
+    this.adapters.set(OPENCODE_LOCAL_PROVIDER_ID, adapter);
+    this.statuses.set(OPENCODE_LOCAL_PROVIDER_ID, {
+      id: OPENCODE_LOCAL_PROVIDER_ID,
+      name: "OpenCode local",
+      kind: "opencode",
+      authenticated: true,
+      local: true,
+      source: "opencode-local",
+      auto: "local",
+      modelCount: 0,
+    });
   }
 
   private mergeOpenCode(): void {
@@ -116,6 +136,8 @@ export class ProviderRegistry {
   private build(): void {
     for (const [id, raw] of Object.entries(this.config.providers)) {
       if (raw.enabled === false) continue;
+      // Reserved for the opt-in integration above.
+      if (id === OPENCODE_LOCAL_PROVIDER_ID) continue;
       const cfg = resolveProviderConfig(id, raw);
       const template = templateFor(id);
       const kind = cfg.kind ?? template?.kind ?? "openai";
@@ -276,6 +298,26 @@ export class ProviderRegistry {
     return [...this.statuses.values()];
   }
 
+  /** Whether a model can receive Wandey's tool schemas. */
+  async supportsTools(ref: string): Promise<boolean> {
+    try {
+      const resolved = await this.resolve(ref);
+      return (await resolved.adapter.supportsTools?.(resolved.model)) ?? true;
+    } catch {
+      // Resolution failures are surfaced when the request starts; do not turn
+      // a missing model into a prompt-shape decision here.
+      return true;
+    }
+  }
+
+  /** Stop child processes and release other adapter resources. */
+  stop(): void {
+    for (const adapter of this.adapters.values()) adapter.dispose?.();
+    this.adapters.clear();
+    this.statuses.clear();
+    this.cache = null;
+  }
+
   catalog(): ProviderCatalogEntry[] {
     const entries = new Map<string, ProviderCatalogEntry>();
     for (const template of Object.values(PROVIDER_TEMPLATES)) {
@@ -312,7 +354,7 @@ export class ProviderRegistry {
     // can be edited or reconnected later. A disabled provider has no status.
     const customIDs = new Set([...Object.keys(this.config.providers), ...this.statuses.keys()]);
     for (const id of customIDs) {
-      if (templateFor(id)) continue;
+      if (templateFor(id) || id === OPENCODE_LOCAL_PROVIDER_ID) continue;
       const raw = this.config.providers[id];
       const cfg = raw ? resolveProviderConfig(id, raw) : undefined;
       const status = this.statuses.get(id);

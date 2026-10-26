@@ -5,7 +5,7 @@ import { ProviderRegistry } from "../src/providers/registry.ts";
 
 function registryWithProviders(providers: typeof DEFAULTS.providers): ProviderRegistry {
   const config = structuredClone(DEFAULTS);
-  config.integrations = { opencode: false };
+  config.integrations = { opencode: false, opencodeLocal: false };
   config.providers = providers;
   return new ProviderRegistry(config, { importOpenCode: false });
 }
@@ -77,6 +77,27 @@ describe("provider catalog", () => {
       connected: false,
       keyStored: false,
     });
+  });
+});
+
+describe("OpenCode local integration", () => {
+  test("is opt-in and stays out of the provider catalog", async () => {
+    const disabled = structuredClone(DEFAULTS);
+    disabled.integrations = { opencode: false, opencodeLocal: false };
+    disabled.providers = {};
+    const off = new ProviderRegistry(disabled, { importOpenCode: false });
+    expect(off.ids()).not.toContain("opencode-local");
+    expect(off.catalog().some((entry) => entry.id === "opencode-local")).toBe(false);
+    off.stop();
+
+    const enabled = structuredClone(DEFAULTS);
+    enabled.integrations = { opencode: false, opencodeLocal: true };
+    enabled.providers = {};
+    const on = new ProviderRegistry(enabled, { importOpenCode: false });
+    expect(on.ids()).toContain("opencode-local");
+    expect(on.catalog().some((entry) => entry.id === "opencode-local")).toBe(false);
+    expect(await on.supportsTools("opencode-local/big-pickle")).toBe(false);
+    on.stop();
   });
 });
 
