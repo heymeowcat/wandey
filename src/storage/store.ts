@@ -11,12 +11,24 @@ import type {
   ResearchJob,
   ResearchJobState,
   ResearchPlan,
+  Run,
+  RunBudget,
+  RunCheckpoint,
+  RunCheckpointState,
+  RunStep,
+  RunStepKind,
+  RunStepStatus,
+  RunStepUsage,
+  RunStatus,
+  RunStopReason,
+  RunUsage,
   Session,
   SessionDetail,
   SessionMode,
   SourcePartData,
   Usage,
 } from "../core/types.ts";
+import { emptyRunUsage, normalizeRunBudget, normalizeRunUsage } from "../core/run-usage.ts";
 import { newID, now } from "../core/util.ts";
 import { canonicalURL as canonicalKey } from "../core/url.ts";
 import { MIGRATIONS } from "./schema.ts";
@@ -225,6 +237,434 @@ export class Store {
       output.push({ role: row.role as "user" | "assistant", content: this.listParts(row.id) });
     }
     return output;
+  }
+
+  // -------------------------------------------------------------------------
+  // Durable runs
+  // -------------------------------------------------------------------------
+
+  /** Run a group of synchronous writes atomically. */
+  transaction<T>(fn: () => T): T {
+    return this.db.transaction(fn)();
+  }
+
+  createRun(options: {
+    sessionID: string;
+    userMessageID: string;
+    prompt: string;
+    mode: SessionMode;
+    model: string | null;
+    budget: RunBudget;
+  }): Run {
+    if (this.activeRun(options.sessionID)) {
+      throw new Error("This session already has an active run.");
+    }
+    const timestamp = now();
+    const run: Run = {
+      id: newID("run"),
+      sessionID: options.sessionID,
+      userMessageID: options.userMessageID,
+      assistantMessageID: null,
+      status: "running",
+      mode: options.mode,
+      model: options.model,
+      prompt: options.prompt,
+      budget: normalizeRunBudget(options.budget),
+      usage: emptyRunUsage(),
+      error: null,
+      stopReason: null,
+      resumeCount: 0,
+      startedAt: timestamp,
+      updatedAt: timestamp,
+      endedAt: null,
+      dismissedAt: null,
+    };
+    this.db
+      .query(
+        `insert into run
+         (id, session_id, user_message_id, assistant_message_id, status, mode, model, prompt,
+          budget, usage, error, stop_reason, resume_count, started_at, updated_at, ended_at, dismissed_at)
+         values (?, ?, ?, null, ?, ?, ?, ?, ?, ?, null, null, 0, ?, ?, null, null)`,
+      )
+      .run(
+        run.id,
+        run.sessionID,
+        run.userMessageID,
+        run.status,
+        run.mode,
+        run.model,
+        run.prompt,
+        JSON.stringify(run.budget),
+        JSON.stringify(run.usage),
+        run.startedAt,
+        run.updatedAt,
+      );
+    return run;
+  }
+
+  getRun(id: string): Run | null {
+    const row = this.db.query("select * from run where id = ?").get(id) as RunRow | null;
+    return row ? rowToRun(row) : null;
+  }
+
+  listRuns(sessionID: string, options: { limit?: number; includeDismissed?: boolean } = {}): Run[] {
+    const clauses = ["session_id = ?"];
+    if (options.includeDismissed === false) clauses.push("dismissed_at is null");
+    const rows = this.db
+      .query(`select * from run where ${clauses.join(" and ")} order by started_at desc, rowid desc limit ?`)
+      .all(sessionID, options.limit ?? 20) as RunRow[];
+    return rows.map(rowToRun);
+  }
+
+  latestRun(sessionID: string, options: { includeDismissed?: boolean } = {}): Run | null {
+    return this.listRuns(sessionID, { limit: 1, ...options })[0] ?? null;
+  }
+
+  activeRun(sessionID: string): Run | null {
+    const row = this.db
+      .query("select * from run where session_id = ? and status in ('running', 'waiting') order by started_at desc limit 1")
+      .get(sessionID) as RunRow | null;
+    return row ? rowToRun(row) : null;
+  }
+
+  updateRun(
+    id: string,
+    patch: Partial<
+      Pick<
+        Run,
+        | "assistantMessageID"
+        | "status"
+        | "model"
+        | "usage"
+        | "error"
+        | "stopReason"
+        | "endedAt"
+        | "dismissedAt"
+      >
+    > & { resumeCount?: number },
+  ): Run | null {
+    const run = this.getRun(id);
+    if (!run) return null;
+    const next: Run = {
+      ...run,
+      ...patch,
+      usage: patch.usage ?? run.usage,
+      resumeCount: patch.resumeCount ?? run.resumeCount,
+      updatedAt: now(),
+    };
+    this.db
+      .query(
+        `update run
+         set assistant_message_id = ?, status = ?, model = ?, usage = ?, error = ?, stop_reason = ?,
+             resume_count = ?, updated_at = ?, ended_at = ?, dismissed_at = ?
+         where id = ?`,
+      )
+      .run(
+        next.assistantMessageID,
+        next.status,
+        next.model,
+        JSON.stringify(next.usage),
+        next.error,
+        next.stopReason,
+        next.resumeCount,
+        next.updatedAt,
+        next.endedAt,
+        next.dismissedAt,
+        id,
+      );
+    return next;
+  }
+
+  /**
+   * A process that died mid-run cannot still be running. Mark those runs
+   * resumable and close any steps that were in flight.
+   */
+  recoverInterruptedRuns(message = "Interrupted by a server restart. Resume it to continue."): number {
+    const rows = this.db
+      .query("select id from run where status in ('running', 'waiting')")
+      .all() as Array<{ id: string }>;
+    if (rows.length === 0) return 0;
+    const timestamp = now();
+    this.transaction(() => {
+      this.db
+        .query(
+          `update run
+           set status = 'interrupted', stop_reason = 'restart', error = coalesce(error, ?),
+               ended_at = coalesce(ended_at, ?), updated_at = ?
+           where status in ('running', 'waiting')`,
+        )
+        .run(message, timestamp, timestamp);
+      this.db
+        .query(
+          `update run_step
+           set status = 'failed', error = coalesce(error, ?), ended_at = coalesce(ended_at, ?), updated_at = ?
+           where status = 'running'`,
+        )
+        .run(message, timestamp, timestamp);
+    });
+    return rows.length;
+  }
+
+  dismissRun(id: string): Run | null {
+    const run = this.getRun(id);
+    if (!run) return null;
+    return this.updateRun(id, { dismissedAt: now() });
+  }
+
+  deleteRun(id: string): void {
+    this.db.query("delete from run where id = ?").run(id);
+  }
+
+  createRunStep(options: {
+    runID: string;
+    stepKey: string;
+    kind: RunStepKind;
+    name: string;
+    attempt?: number;
+    model?: string | null;
+    messageID?: string | null;
+    callID?: string | null;
+    refID?: string | null;
+    title?: string | null;
+    input?: string | null;
+  }): RunStep {
+    const ordinalRow = this.db
+      .query("select coalesce(max(ordinal), -1) + 1 as next from run_step where run_id = ?")
+      .get(options.runID) as { next: number };
+    const timestamp = now();
+    const step: RunStep = {
+      id: newID("stp"),
+      runID: options.runID,
+      stepKey: options.stepKey,
+      ordinal: ordinalRow?.next ?? 0,
+      kind: options.kind,
+      name: options.name,
+      status: "running",
+      attempt: options.attempt ?? 1,
+      model: options.model ?? null,
+      messageID: options.messageID ?? null,
+      callID: options.callID ?? null,
+      refID: options.refID ?? null,
+      title: options.title ?? null,
+      input: options.input ?? null,
+      output: null,
+      usage: null,
+      crawlPages: 0,
+      error: null,
+      startedAt: timestamp,
+      endedAt: null,
+      updatedAt: timestamp,
+    };
+    try {
+      this.db
+        .query(
+          `insert into run_step
+           (id, run_id, step_key, ordinal, kind, name, status, attempt, model, message_id, call_id,
+            ref_id, title, input, output, usage, crawl_pages, error, started_at, ended_at, updated_at)
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, null, null, 0, null, ?, null, ?)`,
+        )
+        .run(
+          step.id,
+          step.runID,
+          step.stepKey,
+          step.ordinal,
+          step.kind,
+          step.name,
+          step.status,
+          step.attempt,
+          step.model,
+          step.messageID,
+          step.callID,
+          step.refID,
+          step.title,
+          step.input,
+          step.startedAt,
+          step.updatedAt,
+        );
+    } catch (err) {
+      if (/unique/i.test((err as Error).message)) {
+        throw new Error(`Run step ${options.stepKey} already has attempt ${step.attempt}.`);
+      }
+      throw err;
+    }
+    return step;
+  }
+
+  updateRunStep(
+    id: string,
+    patch: Partial<
+      Pick<
+        RunStep,
+        | "status"
+        | "model"
+        | "messageID"
+        | "refID"
+        | "title"
+        | "input"
+        | "output"
+        | "usage"
+        | "crawlPages"
+        | "error"
+        | "endedAt"
+      >
+    >,
+  ): RunStep | null {
+    const step = this.getRunStep(id);
+    if (!step) return null;
+    const next: RunStep = { ...step, ...patch, updatedAt: now() };
+    this.db
+      .query(
+        `update run_step
+         set status = ?, model = ?, message_id = ?, ref_id = ?, title = ?, input = ?, output = ?,
+             usage = ?, crawl_pages = ?, error = ?, ended_at = ?, updated_at = ?
+         where id = ?`,
+      )
+      .run(
+        next.status,
+        next.model,
+        next.messageID,
+        next.refID,
+        next.title,
+        next.input,
+        next.output,
+        next.usage ? JSON.stringify(next.usage) : null,
+        next.crawlPages,
+        next.error,
+        next.endedAt,
+        next.updatedAt,
+        id,
+      );
+    return next;
+  }
+
+  getRunStep(id: string): RunStep | null {
+    const row = this.db.query("select * from run_step where id = ?").get(id) as RunStepRow | null;
+    return row ? rowToRunStep(row) : null;
+  }
+
+  latestRunStep(runID: string, stepKey: string): RunStep | null {
+    const row = this.db
+      .query("select * from run_step where run_id = ? and step_key = ? order by attempt desc limit 1")
+      .get(runID, stepKey) as RunStepRow | null;
+    return row ? rowToRunStep(row) : null;
+  }
+
+  findRunStepByRef(refID: string): RunStep | null {
+    const row = this.db
+      .query("select * from run_step where ref_id = ? order by started_at desc limit 1")
+      .get(refID) as RunStepRow | null;
+    return row ? rowToRunStep(row) : null;
+  }
+
+  listRunSteps(runID: string): RunStep[] {
+    const rows = this.db
+      .query("select * from run_step where run_id = ? order by ordinal asc, attempt asc")
+      .all(runID) as RunStepRow[];
+    return rows.map(rowToRunStep);
+  }
+
+  createRunCheckpoint(runID: string, state: RunCheckpointState): RunCheckpoint {
+    const timestamp = now();
+    const checkpoint = this.transaction(() => {
+      const seqRow = this.db
+        .query("select coalesce(max(seq), -1) + 1 as next from run_checkpoint where run_id = ?")
+        .get(runID) as { next: number };
+      const next: RunCheckpoint = {
+        id: newID("ckp"),
+        runID,
+        seq: seqRow?.next ?? 0,
+        state,
+        createdAt: timestamp,
+      };
+      this.db
+        .query("insert into run_checkpoint (id, run_id, seq, state, created_at) values (?, ?, ?, ?, ?)")
+        .run(next.id, next.runID, next.seq, JSON.stringify(next.state), next.createdAt);
+      return next;
+    });
+    return checkpoint;
+  }
+
+  latestRunCheckpoint(runID: string): RunCheckpoint | null {
+    const row = this.db
+      .query("select * from run_checkpoint where run_id = ? order by seq desc limit 1")
+      .get(runID) as RunCheckpointRow | null;
+    return row ? rowToRunCheckpoint(row) : null;
+  }
+
+  listRunCheckpoints(runID: string): RunCheckpoint[] {
+    const rows = this.db
+      .query("select * from run_checkpoint where run_id = ? order by seq asc")
+      .all(runID) as RunCheckpointRow[];
+    return rows.map(rowToRunCheckpoint);
+  }
+
+  /** Delete a message and its parts, e.g. a partial stream before a retry. */
+  deleteMessage(id: string): void {
+    this.db.query("delete from message where id = ?").run(id);
+  }
+
+  /** Remove empty assistant messages left by a crash between insert and checkpoint. */
+  deleteEmptyAssistantMessages(sessionID: string): number {
+    const rows = this.db
+      .query(
+        `select id from message
+         where session_id = ? and role = 'assistant'
+           and not exists (select 1 from part where part.message_id = message.id)`,
+      )
+      .all(sessionID) as Array<{ id: string }>;
+    for (const row of rows) this.deleteMessage(row.id);
+    return rows.length;
+  }
+
+  /** Mark unanswered question parts expired after a restart. */
+  expirePendingQuestions(_message = "Interrupted by a server restart."): number {
+    const rows = this.db.query("select * from part where type = 'question'").all() as PartRow[];
+    let expired = 0;
+    for (const row of rows) {
+      const part = rowToPart(row);
+      if (part.type !== "question" || part.data.status !== "pending") continue;
+      this.updatePart(part.id, { ...part.data, status: "expired" });
+      expired++;
+    }
+    return expired;
+  }
+
+  /** Reconcile the run usage row from persisted step usage. */
+  sumRunUsage(runID: string): RunUsage {
+    const run = this.getRun(runID);
+    const usage = emptyRunUsage();
+    if (!run) return usage;
+    const toolKeys = new Set<string>();
+    for (const step of this.listRunSteps(runID)) {
+      if (step.usage) {
+        usage.inputTokens += step.usage.input ?? 0;
+        usage.outputTokens += step.usage.output ?? 0;
+        usage.totalTokens += step.usage.total ?? (step.usage.input ?? 0) + (step.usage.output ?? 0);
+        usage.costUsd += step.usage.cost ?? 0;
+        usage.estimated = usage.estimated || step.usage.estimated === true;
+      }
+      usage.crawlPages += step.crawlPages;
+      if (step.kind === "tool" && step.status === "completed") toolKeys.add(step.stepKey);
+    }
+    usage.toolCalls = toolKeys.size;
+    usage.elapsedMs = run.usage.elapsedMs;
+    return usage;
+  }
+
+  /**
+   * Crash-window fallback: find the newest research job for this session and
+   * question that is not linked from any run step.
+   */
+  findUnlinkedResearchJob(sessionID: string, question: string, since: number): ResearchJob | null {
+    const row = this.db
+      .query(
+        `select * from research_job
+         where session_id = ? and question = ? and created_at >= ?
+           and id not in (select ref_id from run_step where ref_id is not null)
+         order by created_at desc limit 1`,
+      )
+      .get(sessionID, question, since) as ResearchJobRow | null;
+    return row ? rowToResearchJob(row) : null;
   }
 
   // -------------------------------------------------------------------------
@@ -575,6 +1015,58 @@ interface NoteRow {
   created_at: number;
 }
 
+interface RunRow {
+  id: string;
+  session_id: string;
+  user_message_id: string;
+  assistant_message_id: string | null;
+  status: string;
+  mode: string;
+  model: string | null;
+  prompt: string;
+  budget: string;
+  usage: string;
+  error: string | null;
+  stop_reason: string | null;
+  resume_count: number;
+  started_at: number;
+  updated_at: number;
+  ended_at: number | null;
+  dismissed_at: number | null;
+}
+
+interface RunStepRow {
+  id: string;
+  run_id: string;
+  step_key: string;
+  ordinal: number;
+  kind: string;
+  name: string;
+  status: string;
+  attempt: number;
+  model: string | null;
+  message_id: string | null;
+  call_id: string | null;
+  ref_id: string | null;
+  title: string | null;
+  input: string | null;
+  output: string | null;
+  usage: string | null;
+  crawl_pages: number;
+  error: string | null;
+  started_at: number;
+  ended_at: number | null;
+  updated_at: number;
+}
+
+interface RunCheckpointRow {
+  id: string;
+  run_id: string;
+  seq: number;
+  state: string;
+  created_at: number;
+}
+
 function rowToSession(row: SessionRow): Session {
   return {
     id: row.id,
@@ -644,6 +1136,80 @@ function rowToNote(row: NoteRow): EvidenceNote {
     confidence: row.confidence as EvidenceNote["confidence"],
     round: row.round,
   };
+}
+
+function rowToRun(row: RunRow): Run {
+  return {
+    id: row.id,
+    sessionID: row.session_id,
+    userMessageID: row.user_message_id,
+    assistantMessageID: row.assistant_message_id,
+    status: row.status as RunStatus,
+    mode: (row.mode as SessionMode) ?? "chat",
+    model: row.model,
+    prompt: row.prompt,
+    budget: normalizeRunBudget(safeJSON<RunBudget>(row.budget)),
+    usage: normalizeRunUsage(safeJSON<RunUsage>(row.usage)),
+    error: row.error,
+    stopReason: row.stop_reason as RunStopReason | null,
+    resumeCount: row.resume_count,
+    startedAt: row.started_at,
+    updatedAt: row.updated_at,
+    endedAt: row.ended_at,
+    dismissedAt: row.dismissed_at,
+  };
+}
+
+function rowToRunStep(row: RunStepRow): RunStep {
+  return {
+    id: row.id,
+    runID: row.run_id,
+    stepKey: row.step_key,
+    ordinal: row.ordinal,
+    kind: row.kind as RunStepKind,
+    name: row.name,
+    status: row.status as RunStepStatus,
+    attempt: row.attempt,
+    model: row.model,
+    messageID: row.message_id,
+    callID: row.call_id,
+    refID: row.ref_id,
+    title: row.title,
+    input: row.input,
+    output: row.output,
+    usage: row.usage ? (safeJSON<RunStepUsage>(row.usage) ?? null) : null,
+    crawlPages: row.crawl_pages,
+    error: row.error,
+    startedAt: row.started_at,
+    endedAt: row.ended_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function rowToRunCheckpoint(row: RunCheckpointRow): RunCheckpoint {
+  return {
+    id: row.id,
+    runID: row.run_id,
+    seq: row.seq,
+    state: safeJSON<RunCheckpointState>(row.state) ?? {
+      version: 1,
+      loopStep: 0,
+      phase: "model",
+      assistantMessageID: null,
+      modelStepID: null,
+      toolCalls: [],
+      nextToolIndex: 0,
+    },
+    createdAt: row.created_at,
+  };
+}
+
+function safeJSON<T>(value: string): T | null {
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return null;
+  }
 }
 
 function safeSite(url: string): string {

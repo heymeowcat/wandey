@@ -1,5 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import type { EvidenceNote, FetchedPage, ResearchJobState, ResearchPlan } from "../src/core/types.ts";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { Database } from "bun:sqlite";
+import type { EvidenceNote, FetchedPage, ResearchJobState, ResearchPlan, RunBudget, RunUsage } from "../src/core/types.ts";
+import { MIGRATIONS } from "../src/storage/schema.ts";
 import { Store } from "../src/storage/store.ts";
 
 function page(overrides: Partial<FetchedPage> = {}): FetchedPage {
@@ -377,6 +382,353 @@ describe("Store research jobs and notes", () => {
     expect(store.getSource(session.id, "s1")).toBeNull();
     expect(store.getResearchJob(job.id)).toBeNull();
     expect(store.listNotes(job.id)).toHaveLength(0);
+  });
+});
+
+describe("Store durable runs", () => {
+  let store: Store;
+
+  beforeEach(() => {
+    store = new Store(":memory:");
+  });
+
+  afterEach(() => {
+    store.close();
+  });
+
+  function budget(overrides: Partial<RunBudget> = {}): RunBudget {
+    return {
+      maxTokens: 1000,
+      maxCostUsd: 0.5,
+      maxSeconds: 60,
+      maxToolCalls: 4,
+      maxCrawlPages: 10,
+      ...overrides,
+    };
+  }
+
+  function usage(overrides: Partial<RunUsage> = {}): RunUsage {
+    return {
+      inputTokens: 10,
+      outputTokens: 5,
+      totalTokens: 15,
+      costUsd: 0.01,
+      toolCalls: 1,
+      crawlPages: 2,
+      elapsedMs: 5000,
+      estimated: false,
+      ...overrides,
+    };
+  }
+
+  test("migrates a version 2 database without losing data", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wandey-migrate-"));
+    const file = path.join(dir, "wandey.db");
+    const db = new Database(file, { create: true });
+    db.run(MIGRATIONS[0]!);
+    db.run(MIGRATIONS[1]!);
+    db.run("pragma user_version = 2");
+    db.query(
+      "insert into session (id, title, mode, model, parent_id, archived, created_at, updated_at) values (?, ?, ?, null, null, 0, ?, ?)",
+    ).run("ses_old", "Old session", "chat", 1, 1);
+    db.query(
+      "insert into message (id, session_id, role, model, error, finish_reason, usage, created_at) values (?, ?, ?, null, null, null, null, ?)",
+    ).run("msg_old", "ses_old", "user", 1);
+    db.query(
+      "insert into research_job (id, session_id, question, depth, status, plan, report, error, output_path, state, created_at, updated_at) values (?, ?, ?, ?, ?, null, null, null, null, null, ?, ?)",
+    ).run("job_old", "ses_old", "Old question", "quick", "done", 1, 1);
+    db.close();
+
+    const migrated = new Store(file);
+    try {
+      expect(migrated.getSession("ses_old")?.title).toBe("Old session");
+      expect(migrated.getMessage("msg_old")?.role).toBe("user");
+      expect(migrated.getResearchJob("job_old")?.status).toBe("done");
+      const tables = migrated.db
+        .query("select name from sqlite_master where type = 'table'")
+        .all() as Array<{ name: string }>;
+      const names = new Set(tables.map((row) => row.name));
+      expect(names.has("run")).toBe(true);
+      expect(names.has("run_step")).toBe(true);
+      expect(names.has("run_checkpoint")).toBe(true);
+      expect(Number((migrated.db.query("pragma user_version").get() as { user_version: number }).user_version)).toBe(3);
+    } finally {
+      migrated.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("creates, updates, lists, dismisses, and deletes runs", () => {
+    const session = store.createSession();
+    const user = store.createMessage(session.id, "user");
+    const assistant = store.createMessage(session.id, "assistant");
+    const run = store.createRun({
+      sessionID: session.id,
+      userMessageID: user.id,
+      prompt: "  Research this  ",
+      mode: "research",
+      model: "test/model",
+      budget: budget(),
+    });
+
+    expect(run.status).toBe("running");
+    expect(run.prompt).toBe("  Research this  ");
+    expect(store.getRun(run.id)?.budget).toEqual(budget());
+    expect(store.latestRun(session.id)?.id).toBe(run.id);
+    expect(store.activeRun(session.id)?.id).toBe(run.id);
+    expect(() =>
+      store.createRun({
+        sessionID: session.id,
+        userMessageID: user.id,
+        prompt: "Second",
+        mode: "chat",
+        model: null,
+        budget: budget(),
+      }),
+    ).toThrow("active run");
+
+    const updated = store.updateRun(run.id, {
+      status: "completed",
+      stopReason: "completed",
+      assistantMessageID: assistant.id,
+      usage: usage(),
+      endedAt: 1234,
+    });
+    expect(updated?.status).toBe("completed");
+    expect(updated?.usage).toEqual(usage());
+    expect(store.activeRun(session.id)).toBeNull();
+
+    store.dismissRun(run.id);
+    expect(store.latestRun(session.id)?.dismissedAt).not.toBeNull();
+    expect(store.listRuns(session.id, { includeDismissed: false })).toHaveLength(0);
+    expect(store.listRuns(session.id)).toHaveLength(1);
+
+    store.deleteRun(run.id);
+    expect(store.getRun(run.id)).toBeNull();
+  });
+
+  test("recovery interrupts live runs and fails only running steps", () => {
+    const session = store.createSession();
+    const user = store.createMessage(session.id, "user");
+    const run = store.createRun({
+      sessionID: session.id,
+      userMessageID: user.id,
+      prompt: "Question",
+      mode: "chat",
+      model: "test/model",
+      budget: budget(),
+    });
+    const modelStep = store.createRunStep({
+      runID: run.id,
+      stepKey: "model:0",
+      kind: "model",
+      name: "model",
+      model: "test/model",
+    });
+    const doneStep = store.createRunStep({
+      runID: run.id,
+      stepKey: "tool:0:0:call_1",
+      kind: "tool",
+      name: "web_search",
+    });
+    store.updateRunStep(doneStep.id, { status: "completed", endedAt: 5 });
+
+    expect(store.recoverInterruptedRuns("restarted")).toBe(1);
+    const recovered = store.getRun(run.id)!;
+    expect(recovered.status).toBe("interrupted");
+    expect(recovered.stopReason).toBe("restart");
+    expect(recovered.error).toBe("restarted");
+    expect(recovered.endedAt).not.toBeNull();
+    expect(store.getRunStep(modelStep.id)?.status).toBe("failed");
+    expect(store.getRunStep(modelStep.id)?.error).toBe("restarted");
+    expect(store.getRunStep(doneStep.id)?.status).toBe("completed");
+    expect(store.recoverInterruptedRuns()).toBe(0);
+  });
+
+  test("orders steps by ordinal and keeps attempts unique per key", () => {
+    const session = store.createSession();
+    const user = store.createMessage(session.id, "user");
+    const run = store.createRun({
+      sessionID: session.id,
+      userMessageID: user.id,
+      prompt: "Question",
+      mode: "chat",
+      model: "test/model",
+      budget: budget(),
+    });
+    const first = store.createRunStep({ runID: run.id, stepKey: "model:0", kind: "model", name: "model" });
+    const second = store.createRunStep({
+      runID: run.id,
+      stepKey: "model:0",
+      kind: "model",
+      name: "model",
+      attempt: 2,
+    });
+    const tool = store.createRunStep({
+      runID: run.id,
+      stepKey: "tool:0:0:call_1",
+      kind: "tool",
+      name: "web_search",
+      callID: "call_1",
+    });
+
+    expect([first.ordinal, second.ordinal, tool.ordinal]).toEqual([0, 1, 2]);
+    expect(store.latestRunStep(run.id, "model:0")?.id).toBe(second.id);
+    expect(store.listRunSteps(run.id).map((step) => step.id)).toEqual([first.id, second.id, tool.id]);
+    expect(() =>
+      store.createRunStep({ runID: run.id, stepKey: "model:0", kind: "model", name: "model", attempt: 2 }),
+    ).toThrow("already has attempt 2");
+  });
+
+  test("allocates checkpoint sequence numbers", () => {
+    const session = store.createSession();
+    const user = store.createMessage(session.id, "user");
+    const run = store.createRun({
+      sessionID: session.id,
+      userMessageID: user.id,
+      prompt: "Question",
+      mode: "chat",
+      model: null,
+      budget: budget(),
+    });
+    for (let index = 0; index < 3; index++) {
+      store.createRunCheckpoint(run.id, {
+        version: 1,
+        loopStep: index,
+        phase: "model",
+        assistantMessageID: null,
+        modelStepID: null,
+        toolCalls: [],
+        nextToolIndex: 0,
+      });
+    }
+    expect(store.listRunCheckpoints(run.id).map((checkpoint) => checkpoint.seq)).toEqual([0, 1, 2]);
+    expect(store.latestRunCheckpoint(run.id)?.state.loopStep).toBe(2);
+  });
+
+  test("deletes partial messages and expires pending questions", () => {
+    const session = store.createSession();
+    const empty = store.createMessage(session.id, "assistant");
+    const failed = store.createMessage(session.id, "assistant");
+    store.addPart(session.id, failed.id, "error", { message: "failed" });
+    const message = store.createMessage(session.id, "assistant");
+    const pending = store.addPart(session.id, message.id, "question", {
+      questionID: "q_pending",
+      question: "Pick one",
+      options: [],
+      multiple: false,
+      allowCustom: true,
+      status: "pending",
+    });
+    const answered = store.addPart(session.id, message.id, "question", {
+      questionID: "q_answered",
+      question: "Already answered",
+      options: [],
+      multiple: false,
+      allowCustom: true,
+      answer: ["yes"],
+      status: "answered",
+    });
+
+    expect(store.deleteEmptyAssistantMessages(session.id)).toBe(1);
+    expect(store.getMessage(empty.id)).toBeNull();
+    expect(store.getMessage(failed.id)).not.toBeNull();
+    expect(store.deleteEmptyAssistantMessages(session.id)).toBe(0);
+
+    expect(store.expirePendingQuestions()).toBe(1);
+    const expired = store.getPart(pending.id);
+    expect(expired?.type === "question" && expired.data.status).toBe("expired");
+    const kept = store.getPart(answered.id);
+    expect(kept?.type === "question" && kept.data.status).toBe("answered");
+
+    store.deleteMessage(message.id);
+    expect(store.getPart(pending.id)).toBeNull();
+    expect(store.getPart(answered.id)).toBeNull();
+  });
+
+  test("reconciles usage from steps without double counting retried tools", () => {
+    const session = store.createSession();
+    const user = store.createMessage(session.id, "user");
+    const run = store.createRun({
+      sessionID: session.id,
+      userMessageID: user.id,
+      prompt: "Question",
+      mode: "chat",
+      model: "test/model",
+      budget: budget(),
+    });
+    store.updateRun(run.id, { usage: usage({ elapsedMs: 5000 }) });
+
+    const model = store.createRunStep({ runID: run.id, stepKey: "model:0", kind: "model", name: "model" });
+    store.updateRunStep(model.id, {
+      status: "completed",
+      usage: { input: 100, output: 20, cost: 0.01 },
+    });
+    const failedModel = store.createRunStep({
+      runID: run.id,
+      stepKey: "model:1",
+      kind: "model",
+      name: "model",
+      attempt: 2,
+    });
+    store.updateRunStep(failedModel.id, {
+      status: "failed",
+      usage: { input: 50, output: 10, total: 70, estimated: true },
+    });
+    const tool = store.createRunStep({
+      runID: run.id,
+      stepKey: "tool:0:0:call_1",
+      kind: "tool",
+      name: "fetch_url",
+      callID: "call_1",
+    });
+    store.updateRunStep(tool.id, { status: "completed", crawlPages: 3 });
+    const retried = store.createRunStep({
+      runID: run.id,
+      stepKey: "tool:0:0:call_1",
+      kind: "tool",
+      name: "fetch_url",
+      callID: "call_1",
+      attempt: 2,
+    });
+    store.updateRunStep(retried.id, { status: "completed", crawlPages: 2 });
+
+    expect(store.sumRunUsage(run.id)).toEqual({
+      inputTokens: 150,
+      outputTokens: 30,
+      totalTokens: 190,
+      costUsd: 0.01,
+      toolCalls: 1,
+      crawlPages: 5,
+      elapsedMs: 5000,
+      estimated: true,
+    });
+  });
+
+  test("finds research jobs that are not linked from a run step", () => {
+    const session = store.createSession();
+    const job = store.createResearchJob({ sessionID: session.id, question: "What changed?", depth: "quick" });
+    expect(store.findUnlinkedResearchJob(session.id, "What changed?", job.createdAt - 1)?.id).toBe(job.id);
+    expect(store.findUnlinkedResearchJob(session.id, "Other question", 0)).toBeNull();
+
+    const user = store.createMessage(session.id, "user");
+    const run = store.createRun({
+      sessionID: session.id,
+      userMessageID: user.id,
+      prompt: "What changed?",
+      mode: "research",
+      model: "test/model",
+      budget: budget(),
+    });
+    store.createRunStep({
+      runID: run.id,
+      stepKey: "tool:0:0:call_1",
+      kind: "tool",
+      name: "deep_research",
+      refID: job.id,
+    });
+    expect(store.findUnlinkedResearchJob(session.id, "What changed?", 0)).toBeNull();
+    expect(store.findRunStepByRef(job.id)?.runID).toBe(run.id);
   });
 });
 

@@ -230,6 +230,8 @@ export interface QuestionPartData {
   allowCustom: boolean;
   answer?: string[];
   custom?: string;
+  /** Tool call that asked this question, used to reuse it on resume. */
+  callID?: string;
   /** How the question ended, in case it was never answered. */
   status?: "pending" | "answered" | "expired";
 }
@@ -278,6 +280,123 @@ export type Part =
 export interface SessionDetail {
   session: Session;
   messages: Array<{ message: Message; parts: Part[] }>;
+}
+
+// ---------------------------------------------------------------------------
+// Durable runs
+// ---------------------------------------------------------------------------
+
+export type RunStatus =
+  | "running"
+  | "waiting"
+  | "interrupted"
+  | "completed"
+  | "aborted"
+  | "failed";
+
+export type RunStopReason =
+  | "completed"
+  | "user"
+  | "budget"
+  | "step_limit"
+  | "error"
+  | "restart";
+
+export interface RunBudget {
+  /** 0 means unlimited. */
+  maxTokens: number;
+  maxCostUsd: number;
+  maxSeconds: number;
+  maxToolCalls: number;
+  maxCrawlPages: number;
+}
+
+export interface RunUsage {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  costUsd: number;
+  toolCalls: number;
+  crawlPages: number;
+  /** Active time across resumes, excluding server downtime. */
+  elapsedMs: number;
+  /** True when any token count was estimated instead of provider-reported. */
+  estimated: boolean;
+}
+
+export interface Run {
+  id: string;
+  sessionID: string;
+  userMessageID: string;
+  assistantMessageID: string | null;
+  status: RunStatus;
+  mode: SessionMode;
+  model: string | null;
+  prompt: string;
+  budget: RunBudget;
+  usage: RunUsage;
+  error: string | null;
+  stopReason: RunStopReason | null;
+  resumeCount: number;
+  startedAt: number;
+  updatedAt: number;
+  endedAt: number | null;
+  dismissedAt: number | null;
+}
+
+export type RunStepKind = "model" | "tool";
+export type RunStepStatus = "running" | "completed" | "failed" | "aborted";
+
+/** Usage as persisted on a step. `estimated` is ledger-only metadata. */
+export interface RunStepUsage extends Usage {
+  estimated?: boolean;
+}
+
+export interface RunStep {
+  id: string;
+  runID: string;
+  /** Stable identity: `model:<loop>` or `tool:<loop>:<index>:<callID>`. */
+  stepKey: string;
+  ordinal: number;
+  kind: RunStepKind;
+  /** "model" or the tool name. */
+  name: string;
+  status: RunStepStatus;
+  attempt: number;
+  model: string | null;
+  messageID: string | null;
+  callID: string | null;
+  /** External durable object, currently the deep-research job id. */
+  refID: string | null;
+  title: string | null;
+  /** Truncated JSON metadata, never the full system prompt. */
+  input: string | null;
+  /** Truncated result text. */
+  output: string | null;
+  usage: RunStepUsage | null;
+  crawlPages: number;
+  error: string | null;
+  startedAt: number;
+  endedAt: number | null;
+  updatedAt: number;
+}
+
+export interface RunCheckpointState {
+  version: 1;
+  loopStep: number;
+  phase: "model" | "tools" | "done";
+  assistantMessageID: string | null;
+  modelStepID: string | null;
+  toolCalls: Array<{ id: string; name: string; args: Record<string, unknown> }>;
+  nextToolIndex: number;
+}
+
+export interface RunCheckpoint {
+  id: string;
+  runID: string;
+  seq: number;
+  state: RunCheckpointState;
+  createdAt: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -435,6 +554,9 @@ export type ServerEvent =
   | { type: "question.done"; sessionID: string; part: Part }
   | { type: "crawl.progress"; sessionID: string; progress: CrawlProgress }
   | { type: "research.progress"; sessionID: string; part: Part }
+  | { type: "run.created"; sessionID: string; run: Run }
+  | { type: "run.updated"; sessionID: string; run: Run }
+  | { type: "run.step"; sessionID: string; runID: string; step: RunStep }
   | { type: "toast"; level: "info" | "error" | "success"; message: string };
 
 /** Events the UI sends back to the agent. */

@@ -101,4 +101,65 @@ export const MIGRATIONS: string[] = [
   `
   alter table research_job add column state text;
   `,
+  // 2 -> 3
+  `
+  create table if not exists run (
+    id text primary key,
+    session_id text not null references session(id) on delete cascade,
+    user_message_id text not null references message(id) on delete cascade,
+    assistant_message_id text references message(id) on delete set null,
+    status text not null,
+    mode text not null,
+    model text,
+    prompt text not null,
+    budget text not null,
+    usage text not null,
+    error text,
+    stop_reason text,
+    resume_count integer not null default 0,
+    started_at integer not null,
+    updated_at integer not null,
+    ended_at integer,
+    dismissed_at integer
+  );
+  create index if not exists run_session on run(session_id, started_at desc);
+  create index if not exists run_open on run(status, updated_at desc);
+  create unique index if not exists run_active_session on run(session_id)
+    where status in ('running', 'waiting');
+
+  create table if not exists run_step (
+    id text primary key,
+    run_id text not null references run(id) on delete cascade,
+    step_key text not null,
+    ordinal integer not null,
+    kind text not null,
+    name text not null,
+    status text not null,
+    attempt integer not null default 1,
+    model text,
+    message_id text references message(id) on delete set null,
+    call_id text,
+    ref_id text,
+    title text,
+    input text,
+    output text,
+    usage text,
+    crawl_pages integer not null default 0,
+    error text,
+    started_at integer not null,
+    ended_at integer,
+    updated_at integer not null
+  );
+  create index if not exists run_step_run on run_step(run_id, ordinal, attempt);
+  create unique index if not exists run_step_attempt on run_step(run_id, step_key, attempt);
+
+  create table if not exists run_checkpoint (
+    id text primary key,
+    run_id text not null references run(id) on delete cascade,
+    seq integer not null,
+    state text not null,
+    created_at integer not null
+  );
+  create unique index if not exists run_checkpoint_seq on run_checkpoint(run_id, seq);
+  `,
 ];
