@@ -386,8 +386,8 @@ export async function startServer(options: ServerOptions): Promise<WandeyServer>
             if (agent.isRunning(sessionID)) return json({ error: "Session is already running" }, 409);
             const body = await readBody<{ text?: string; model?: string; mode?: SessionMode }>(req);
             if (!body.text?.trim()) return json({ error: "Prompt text is required" }, 400);
-            const message = await agent.prompt(sessionID, body.text, { model: body.model, mode: body.mode });
-            return json({ message }, 202);
+            const result = await agent.prompt(sessionID, body.text, { model: body.model, mode: body.mode });
+            return json({ message: result.message, run: result.run }, 202);
           }
 
           if (rest === "abort" && req.method === "POST") {
