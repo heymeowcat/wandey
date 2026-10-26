@@ -217,11 +217,53 @@ wandey serve --no-opencode
 wandey chat --no-opencode
 ```
 
+### OpenCode free models (local runtime)
+
+OpenCode's anonymous free models are available through an optional local runtime. The free
+tier only works inside OpenCode itself; a direct API call is rejected. Wandey therefore starts
+the OpenCode CLI on demand and talks to its local HTTP API. It does not impersonate a client
+or copy free-tier headers.
+
+Install OpenCode and make sure `opencode` is on your `PATH`. Then enable the integration:
+
+```sh
+wandey config set integrations.opencodeLocal true
+wandey serve --opencode-local
+wandey chat --opencode-local --model opencode-local/big-pickle
+```
+
+In the browser, open **Providers → Local runtime → Enable**. The card shows the runtime status
+and how many free models are available.
+
+Model references use the `opencode-local` provider:
+
+```text
+opencode-local/big-pickle
+opencode-local/deepseek-v4.1-flash-free
+opencode-local/beam-free
+```
+
+`wandey models --provider opencode-local` lists the free models currently advertised by
+OpenCode, with a built-in fallback list when the network is unavailable.
+
+The runtime is isolated. Wandey starts `opencode serve` on a random loopback port with a
+throwaway `HOME`, XDG directories, and an empty working directory. It cannot read your project,
+Wandey's config or keys, your OpenCode config, or your OpenCode history. A custom text agent
+disables shell, edit, subagent, external-directory, todo, question, web fetch/search, LSP, skill,
+and browser tools. Read-only discovery tools stay enabled because the free tier rejects requests
+when tools are fully denied; the empty temporary directory limits what they can see. The
+process is stopped when the integration is disabled or Wandey exits.
+
+**This backend is text-only.** Wandey does not send tool schemas, so these models cannot browse,
+cite sources, or run deep research from chat. They answer from the conversation and their own
+knowledge. Use a tool-capable provider when you need current sources or a cited report.
+
 ### Listing models
 
 ```sh
 wandey models
 wandey models --provider openrouter --free --limit 10
+wandey models --provider opencode-local
 wandey models --all
 wandey models --refresh
 wandey models --json
@@ -444,6 +486,7 @@ The UI is intentionally close to a small IDE chat:
 - deep-research progress card and full report viewer;
 - research dashboard with jobs, plans, evidence notes, and source chips;
 - model picker, provider summary, reconnect indicator, and light/dark theme;
+- provider manager with a Local runtime toggle for OpenCode free models;
 - responsive layout for narrow windows.
 
 Keyboard shortcuts:
@@ -493,12 +536,15 @@ work. Piping text into `wandey chat` is supported, which makes simple scripted c
 ```text
 wandey [serve] [--host <host>] [--port <n>] [--model <ref>]
                 [--no-open] [--dev] [--no-opencode]
+                [--opencode-local | --no-opencode-local]
 
 wandey chat [--model <ref>] [--research | --chat]
             [--session <id> | --continue] [--reasoning] [--no-opencode]
+            [--opencode-local | --no-opencode-local]
 
 wandey models [--provider <id>] [--free] [--all] [--limit <n>]
               [--refresh] [--json]
+              [--opencode-local | --no-opencode-local]
 
 wandey doctor [--json]
 
@@ -508,7 +554,7 @@ wandey version
 ```
 
 `doctor` checks storage, providers, search, PDF support, renderer settings, and OpenCode
-integration. It exits non-zero only for critical problems such as unreadable storage or no
+integrations. It exits non-zero only for critical problems such as unreadable storage or no
 usable model provider.
 
 ## Configuration
@@ -570,6 +616,8 @@ data home too.
 - `server`: local host, port, and whether `serve` opens a browser.
 - `providers`: provider records, as described above.
 - `integrations.opencode`: import API-key credentials from OpenCode (default `true`).
+- `integrations.opencodeLocal`: enable OpenCode's free models through the local CLI runtime
+  (default `false`).
 - `search`: provider list and `maxResults`.
 - `crawl`: crawler, PDF, and renderer settings.
 - `research`: deep-research budgets and model overrides.
@@ -613,7 +661,8 @@ network.
 | --- | --- | --- |
 | `GET` | `/api/health` | Version and uptime. |
 | `GET` | `/api/models` | Models and provider statuses. |
-| `GET` | `/api/providers` | Provider statuses only. |
+| `GET` | `/api/providers` | Provider statuses and integration flags. |
+| `POST` | `/api/integrations/opencode-local` | Enable or disable the local OpenCode runtime (`enabled`). |
 | `GET` | `/api/config` | Redacted config and paths. |
 | `GET` | `/api/sessions` | List sessions. |
 | `POST` | `/api/sessions` | Create a session (`title`, `mode`, `model`). |
@@ -653,7 +702,8 @@ src/server/server.ts
 - `src/core/` holds shared types, config, URL canonicalization, events, and utilities.
 - `src/agent/` owns the streamed model/tool loop and run lifecycle. It publishes server
   events and never knows whether the consumer is a browser or the terminal.
-- `src/providers/` adapts three wire protocols behind one `ProviderAdapter` interface.
+- `src/providers/` adapts three wire protocols plus the optional local OpenCode runtime behind
+  one `ProviderAdapter` interface.
 - `src/tools/` contains small, independently testable tools with a JSON-schema-style
   parameter description.
 - `src/research/` is the deep-research pipeline. It depends on tools only through injected
