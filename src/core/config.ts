@@ -70,6 +70,21 @@ export interface CrawlConfig {
   };
 }
 
+export interface AgentBudgetConfig {
+  /** 0 means unlimited. */
+  maxTokens: number;
+  maxCostUsd: number;
+  maxSeconds: number;
+  maxToolCalls: number;
+  maxCrawlPages: number;
+}
+
+export interface AgentRetryConfig {
+  /** Total attempts per model candidate, including the first. */
+  attempts: number;
+  baseDelayMs: number;
+}
+
 export interface ResearchConfig {
   depth: "quick" | "standard" | "deep" | "exhaustive";
   rounds: number;
@@ -103,6 +118,10 @@ export interface Config {
     autoTitle: boolean;
     systemExtra: string;
     streamReasoning: boolean;
+    budget: AgentBudgetConfig;
+    retry: AgentRetryConfig;
+    /** Ordered fallback refs, tried after the primary model is exhausted. */
+    fallback: string[];
   };
   providers: Record<string, ProviderConfig>;
   integrations: {
@@ -148,6 +167,18 @@ export const DEFAULTS: Config = {
     autoTitle: true,
     systemExtra: "",
     streamReasoning: true,
+    budget: {
+      maxTokens: 0,
+      maxCostUsd: 0,
+      maxSeconds: 0,
+      maxToolCalls: 0,
+      maxCrawlPages: 0,
+    },
+    retry: {
+      attempts: 3,
+      baseDelayMs: 700,
+    },
+    fallback: [],
   },
   providers: {
     ollama: {
@@ -260,6 +291,7 @@ export function loadConfig(env: Record<string, string | undefined> = Bun.env): L
     config.research.outputDir = path.join(paths.home, "research");
   }
 
+  normalizeAgentLimits(config);
   applyPortEnv(config, env);
   applyEnvProviders(config, env);
   applyEnvSearch(config, env);
@@ -271,7 +303,14 @@ export function mergeConfig(base: Config, patch: Partial<Config>): Config {
   const next: Config = {
     ...clone,
     server: { ...clone.server, ...(patch.server ?? {}) },
-    agent: { ...clone.agent, ...(patch.agent ?? {}) },
+    agent: {
+      ...clone.agent,
+      ...(patch.agent ?? {}),
+      budget: { ...clone.agent.budget, ...(patch.agent?.budget ?? {}) },
+      retry: { ...clone.agent.retry, ...(patch.agent?.retry ?? {}) },
+      // Arrays are replaced, not merged: fallback order matters.
+      fallback: patch.agent?.fallback ?? clone.agent.fallback,
+    },
     providers: { ...clone.providers, ...(patch.providers ?? {}) },
     integrations: { ...clone.integrations, ...(patch.integrations ?? {}) },
     search: {
@@ -290,6 +329,26 @@ export function mergeConfig(base: Config, patch: Partial<Config>): Config {
     storage: { ...clone.storage, ...(patch.storage ?? {}) },
   };
   return next;
+}
+
+/**
+ * Keep hand-edited config safe: negative limits become unlimited (0), retries
+ * always make at least one attempt, and fallback refs stay unique in order.
+ */
+function normalizeAgentLimits(config: Config): void {
+  const budget = config.agent.budget;
+  budget.maxTokens = nonNegative(budget.maxTokens);
+  budget.maxCostUsd = nonNegative(budget.maxCostUsd);
+  budget.maxSeconds = nonNegative(budget.maxSeconds);
+  budget.maxToolCalls = nonNegative(budget.maxToolCalls);
+  budget.maxCrawlPages = nonNegative(budget.maxCrawlPages);
+  config.agent.retry.attempts = Math.max(1, Math.floor(nonNegative(config.agent.retry.attempts)));
+  config.agent.retry.baseDelayMs = nonNegative(config.agent.retry.baseDelayMs);
+  config.agent.fallback = [...new Set(config.agent.fallback.map((ref) => ref.trim()).filter(Boolean))];
+}
+
+function nonNegative(value: number | undefined): number {
+  return Number.isFinite(value) && value! > 0 ? value! : 0;
 }
 
 /** Add providers whose API key is already in the environment. */

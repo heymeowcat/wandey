@@ -4,6 +4,7 @@ import type {
   ChatMessage,
   FinishReason,
   Message,
+  ModelInfo,
   Part,
   ProviderEvent,
   QuestionPartData,
@@ -31,6 +32,7 @@ import type { AskRequest, AskResponse, DeepResearchOptions, ToolContext, ToolReg
 import { ResearchEngine, type ResearchObserver } from "../research/engine.ts";
 import { buildProviderHistory } from "./history.ts";
 import { buildSystemPrompt } from "./prompt.ts";
+import { BudgetExceededError, RunBudgetController, usageCost } from "./budget.ts";
 
 /**
  * The agent loop.
@@ -122,9 +124,8 @@ export class Agent {
         prompt,
         mode: options.mode ?? session.mode,
         model: options.model?.trim() || session.model || config.agent.model || null,
-        // Budget configuration is added in a later commit; all-zero means
-        // unlimited and matches today's behavior.
-        budget: normalizeRunBudget(undefined),
+        // Budget snapshots are per run: changing config affects new runs only.
+        budget: normalizeRunBudget(config.agent.budget),
       });
       return { user, run };
     });
@@ -368,6 +369,8 @@ export class Agent {
     const elapsed = () => baseElapsedMs + (Date.now() - activeStart);
 
     let terminal: { status: RunStatus; stopReason: RunStopReason; error: string | null } | null = null;
+    let stopBudget: (() => void) | null = null;
+    let budgetError: BudgetExceededError | null = null;
 
     try {
       const session = store.getSession(sessionID);
@@ -403,6 +406,24 @@ export class Agent {
       }
 
       const canUseTools = await registry.supportsTools(model);
+      // Prefer the cached catalog; only probe providers when a cost budget
+      // actually needs pricing data.
+      const modelInfo =
+        registry.modelInfoSync(model) ??
+        (run.budget.maxCostUsd > 0 ? await registry.modelInfo(model) : null);
+      const budget = new RunBudgetController({
+        budget: run.budget,
+        usage: store.sumRunUsage(runID),
+        toolKeys: store
+          .listRunSteps(runID)
+          .filter((step) => step.kind === "tool" && step.status === "completed")
+          .map((step) => step.stepKey),
+        onExceeded: (error) => {
+          budgetError = error;
+          if (!controller.signal.aborted) controller.abort(error);
+        },
+      });
+      stopBudget = budget.start();
       const checkpoint = store.latestRunCheckpoint(runID);
       let state: RunCheckpointState = checkpoint?.state ?? {
         version: 1,
@@ -443,6 +464,7 @@ export class Agent {
               state.loopStep,
               index,
               elapsed,
+              budget,
             );
             if (!completed) break;
             state = { ...state, nextToolIndex: index + 1 };
@@ -470,6 +492,9 @@ export class Agent {
           store.createRunCheckpoint(runID, state);
           continue;
         }
+
+        budget.checkModel();
+        budget.beginModelAttempt();
 
         const history = buildProviderHistory(store, sessionID, config.agent.contextChars);
         const system = buildSystemPrompt({
@@ -529,6 +554,7 @@ export class Agent {
         let lastPersist = Date.now();
         const calls: ToolCallBlock[] = [];
         const usage: Usage = {};
+        let sawUsage = false;
         let finishReason: FinishReason = "stop";
         let streamError: string | null = null;
 
@@ -582,7 +608,11 @@ export class Agent {
                 persistStreaming();
               },
               onToolCall: (call) => calls.push(call),
-              onUsage: (value) => mergeUsage(usage, value),
+              onUsage: (value) => {
+                sawUsage = true;
+                mergeUsage(usage, value);
+                budget.addUsage(model, value, modelInfo);
+              },
               onFinish: (reason, error) => {
                 finishReason = reason;
                 if (error) streamError = error;
@@ -629,6 +659,31 @@ export class Agent {
         );
         const traceOutput = truncate(text, TRACE_OUTPUT_CHARS);
 
+        // Providers sometimes omit usage entirely. Estimate from the prompt and
+        // output so the budget still sees the spend.
+        if (!sawUsage) {
+          try {
+            budget.addEstimatedUsage(
+              system.length + historyChars(history.messages),
+              text.length + reasoning.length,
+              modelInfo,
+            );
+          } catch (err) {
+            if (!(err instanceof BudgetExceededError)) throw err;
+          }
+        }
+
+        if (budgetError) {
+          this.finishStep(modelStep, sessionID, {
+            status: "aborted",
+            error: budgetError.message,
+            output: traceOutput,
+            usage: stepUsage,
+            endedAt: now(),
+          });
+          terminal = this.budgetTerminal(sessionID, assistant.id, budgetError);
+          break;
+        }
         if (streamError) {
           this.finishStep(modelStep, sessionID, {
             status: "failed",
@@ -696,7 +751,13 @@ export class Agent {
       }
 
       if (!terminal) {
-        if (finalised) {
+        if (budgetError) {
+          terminal = this.budgetTerminal(
+            sessionID,
+            store.getRun(runID)?.assistantMessageID ?? null,
+            budgetError,
+          );
+        } else if (finalised) {
           terminal = { status: "completed", stopReason: "completed", error: null };
         } else if (controller.signal.aborted) {
           terminal = { status: "aborted", stopReason: "user", error: null };
@@ -709,14 +770,22 @@ export class Agent {
         }
       }
     } catch (err) {
-      const message = (err as Error).message;
-      if (!controller.signal.aborted) {
+      const failure = budgetError ?? (err instanceof BudgetExceededError ? err : null);
+      if (failure) {
+        terminal = this.budgetTerminal(
+          sessionID,
+          store.getRun(runID)?.assistantMessageID ?? null,
+          failure,
+        );
+      } else if (!controller.signal.aborted) {
+        const message = (err as Error).message;
         this.fail(sessionID, message);
         terminal = { status: "failed", stopReason: "error", error: message };
       } else {
         terminal = { status: "aborted", stopReason: "user", error: null };
       }
     } finally {
+      stopBudget?.();
       if (terminal) {
         this.finishRun(runID, terminal.status, terminal.stopReason, terminal.error, elapsed());
       }
@@ -760,6 +829,7 @@ export class Agent {
     loopStep: number,
     callIndex: number,
     elapsed: () => number,
+    budget: RunBudgetController,
   ): Promise<boolean> {
     const { store, tools, bus } = this.deps;
     const sessionID = run.sessionID;
@@ -782,6 +852,11 @@ export class Agent {
         endedAt: now(),
       });
     }
+
+    // Pre-flight before creating a new attempt, so a budget stop never leaves
+    // a half-created tool part behind.
+    budget.checkTool();
+    budget.addToolCall(stepKey);
 
     let toolPart: Part;
     if (existingPart) {
@@ -832,7 +907,12 @@ export class Agent {
       signal: controller.signal,
       emit: (event) => {
         if (event.type === "crawl.progress") {
-          crawlPages = Math.max(crawlPages, event.progress.fetched);
+          const fetched = Math.max(0, event.progress.fetched);
+          if (fetched > crawlPages) {
+            const delta = fetched - crawlPages;
+            crawlPages = fetched;
+            budget.addCrawlPages(delta);
+          }
         }
         bus.publish(event);
       },
@@ -843,7 +923,9 @@ export class Agent {
       registry: this.deps.registry,
       ask: (request) => this.askUser(sessionID, messageID, request, controller, callID),
       deepResearch: (question, depth, options) =>
-        this.runDeepResearch(sessionID, question, depth, options, run, step),
+        this.runDeepResearch(sessionID, question, depth, options, run, step, budget, (delta) => {
+          crawlPages += delta;
+        }),
     };
 
     try {
@@ -870,6 +952,12 @@ export class Agent {
         return false;
       }
 
+      // fetch_url does not emit crawl progress; count the page it read.
+      if (!result.isError && call.name === "fetch_url" && (result.sources?.length ?? 0) > 0) {
+        crawlPages += 1;
+        budget.addCrawlPages(1);
+      }
+
       if (result.sources && result.sources.length > 0) {
         const existing = new Set(
           store.listParts(messageID).filter((part) => part.type === "source").map((part) => part.data.sourceID),
@@ -893,13 +981,14 @@ export class Agent {
       return true;
     } catch (err) {
       const message = (err as Error).message;
+      const budgetFailure = (err as Error)?.name === "BudgetExceededError";
       this.finishStep(step, sessionID, {
-        status: controller.signal.aborted ? "aborted" : "failed",
+        status: controller.signal.aborted || budgetFailure ? "aborted" : "failed",
         error: message,
         crawlPages,
         endedAt: now(),
       });
-      if (!controller.signal.aborted) throw err;
+      if (budgetFailure || !controller.signal.aborted) throw err;
       return false;
     } finally {
       this.syncRunUsage(run.id, elapsed());
@@ -913,17 +1002,51 @@ export class Agent {
     options: DeepResearchOptions,
     run: Run,
     step: RunStep,
+    budget: RunBudgetController,
+    onPages: (delta: number) => void,
   ): Promise<ToolResult> {
-    const { store } = this.deps;
+    const { store, registry } = this.deps;
     const session = store.getSession(sessionID);
     const model = session?.model ?? this.deps.config.agent.model;
     const normalized = question.replace(/\s+/g, " ").trim();
 
+    // Research uses up to three model refs. Resolve their pricing once so the
+    // observer can account for batch calls without doing I/O in a callback.
+    const researchModels = new Set([
+      model,
+      this.deps.config.research.planModel.trim() || model,
+      this.deps.config.research.workerModel.trim() || model,
+      this.deps.config.research.synthModel.trim() || model,
+    ]);
+    const modelInfo = new Map<string, ModelInfo | null>();
+    for (const ref of researchModels) modelInfo.set(ref, registry.modelInfoSync(ref));
+
+    const usage: RunStepUsage = { input: 0, output: 0, total: 0, cost: 0 };
     const observer: ResearchObserver = {
       onJobCreated: (job) => {
         const updated = store.updateRunStep(step.id, { refID: job.id });
         if (updated) this.publishRunStep(sessionID, updated);
       },
+      onModelAttempt: () => budget.beginModelAttempt(),
+      onModelUsage: (ref, value, estimated) => {
+        const info = modelInfo.get(ref) ?? registry.modelInfoSync(ref);
+        usage.input = (usage.input ?? 0) + (value.input ?? 0);
+        usage.output = (usage.output ?? 0) + (value.output ?? 0);
+        usage.total = (usage.total ?? 0) + (value.total ?? (value.input ?? 0) + (value.output ?? 0));
+        usage.cost = (usage.cost ?? 0) + usageCost(value, info);
+        usage.estimated = usage.estimated || estimated;
+        const saved = store.updateRunStep(step.id, { usage: { ...usage } });
+        if (saved) this.publishRunStep(sessionID, saved);
+        budget.addUsage(ref, value, info, estimated);
+      },
+      onPagesFetched: (delta) => {
+        const current = store.getRunStep(step.id);
+        const saved = store.updateRunStep(step.id, { crawlPages: (current?.crawlPages ?? 0) + delta });
+        if (saved) this.publishRunStep(sessionID, saved);
+        onPages(delta);
+        budget.addCrawlPages(delta);
+      },
+      assertBudget: () => budget.check(),
     };
 
     // A linked job is authoritative: resume it instead of creating a second
@@ -1179,6 +1302,23 @@ export class Agent {
   private addErrorPart(sessionID: string, messageID: string, message: string): void {
     const part = this.deps.store.addPart(sessionID, messageID, "error", { message });
     this.deps.bus.publish({ type: "part.created", sessionID, messageID, part });
+  }
+
+  private budgetTerminal(
+    sessionID: string,
+    messageID: string | null,
+    error: BudgetExceededError,
+  ): { status: "aborted"; stopReason: "budget"; error: string } {
+    const message = error.message;
+    if (messageID && this.deps.store.getMessage(messageID)) {
+      this.addErrorPart(sessionID, messageID, message);
+      this.deps.bus.publish({ type: "session.error", sessionID, message });
+    } else {
+      // No assistant message exists yet (for example, a stop before the first
+      // model call). Surface the reason in a fresh error message.
+      this.fail(sessionID, message);
+    }
+    return { status: "aborted", stopReason: "budget", error: message };
   }
 
   private fail(sessionID: string, message: string): void {

@@ -263,6 +263,32 @@ export class ProviderRegistry {
     return models.find((model) => model.supportsTools !== false)?.ref ?? models[0]?.ref ?? null;
   }
 
+  /**
+   * Pricing and context metadata for a model ref. Missing catalog data is not
+   * fatal: budgets fall back to provider-reported usage or estimates.
+   */
+  async modelInfo(ref: string): Promise<ModelInfo | null> {
+    try {
+      const resolved = await this.resolve(ref);
+      const models = await this.listModels();
+      return models.find((model) => model.ref === resolved.ref) ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Synchronous lookup against the last catalog refresh, for observer callbacks. */
+  modelInfoSync(ref: string): ModelInfo | null {
+    const models = this.cache?.models;
+    if (!models) return null;
+    const trimmed = ref.trim();
+    const exact = models.find((model) => model.ref === trimmed || model.id === trimmed);
+    if (exact) return exact;
+    const { provider, model } = parseModelRef(trimmed);
+    if (!provider || !model) return null;
+    return models.find((entry) => entry.provider === provider && entry.id === model) ?? null;
+  }
+
   async resolve(ref: string, refresh = false): Promise<Resolved> {
     const { provider: providerID, model } = parseModelRef(ref.trim());
     if (!model) throw new Error("Model ref is empty. Use provider/model.");

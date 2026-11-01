@@ -621,3 +621,88 @@ describe("Agent run resume", () => {
     if (questions[0]?.type === "question") expect(questions[0].data.status).toBe("answered");
   });
 });
+
+describe("Agent run budgets", () => {
+  test("stops a run when the token budget is exceeded", async () => {
+    const h = setup(() => textResponse("hello", { input: 6, output: 4, total: 10 }), {
+      config: (config) => {
+        config.agent.budget.maxTokens = 5;
+      },
+    });
+
+    const { run } = await h.agent.prompt(h.sessionID, "Hi");
+    const done = await waitForRun(h.store, run.id);
+
+    expect(done.status).toBe("aborted");
+    expect(done.stopReason).toBe("budget");
+    expect(done.error).toContain("max 5 tokens");
+    expect(done.usage.totalTokens).toBe(10);
+
+    const assistant = h.store
+      .getSessionDetail(h.sessionID)!
+      .messages.find((entry) => entry.message.role === "assistant")!;
+    expect(assistant.parts.some((part) => part.type === "error" && part.data.message.includes("budget"))).toBe(true);
+    expect(h.events.some((event) => event.type === "session.error")).toBe(true);
+    await expect(h.agent.resumeRun(run.id)).rejects.toThrow("budget");
+  });
+
+  test("stops before starting a tool that would exceed the call limit", async () => {
+    const h = setup(
+      (_ref, _request, call) =>
+        call <= 2
+          ? toolCallResponse([{ id: `call_${call}`, name: "echo", args: { value: String(call) } }])
+          : textResponse("done"),
+      {
+        config: (config) => {
+          config.agent.budget.maxToolCalls = 1;
+        },
+      },
+    );
+
+    const { run } = await h.agent.prompt(h.sessionID, "Use tools");
+    const done = await waitForRun(h.store, run.id);
+
+    expect(done.status).toBe("aborted");
+    expect(done.stopReason).toBe("budget");
+    expect(done.error).toContain("max 1 tool calls");
+    expect(done.usage.toolCalls).toBe(1);
+    expect(h.store.listRunSteps(run.id).filter((step) => step.kind === "tool" && step.status === "completed")).toHaveLength(1);
+  });
+
+  test("stops after a fetch exceeds the crawl limit", async () => {
+    const h = setup(
+      (_ref, _request, call) =>
+        call <= 2
+          ? toolCallResponse([
+              { id: `call_${call}`, name: "fetch_url", args: { url: `https://example.com/${call}` } },
+            ])
+          : textResponse("done"),
+      {
+        config: (config) => {
+          config.agent.budget.maxCrawlPages = 1;
+        },
+      },
+    );
+    h.tools.register({
+      name: "fetch_url",
+      description: "Fetch one page",
+      parameters: { type: "object", properties: { url: { type: "string" } } },
+      async execute(args) {
+        const url = String(args.url ?? "");
+        return {
+          title: "Fetched",
+          output: `page:${url}`,
+          sources: [{ sourceID: "s1", url, title: "Page" }],
+        };
+      },
+    });
+
+    const { run } = await h.agent.prompt(h.sessionID, "Fetch pages");
+    const done = await waitForRun(h.store, run.id);
+
+    expect(done.status).toBe("aborted");
+    expect(done.stopReason).toBe("budget");
+    expect(done.error).toContain("max 1 crawled pages");
+    expect(done.usage.crawlPages).toBe(2);
+  });
+});

@@ -55,6 +55,22 @@ describe("mergeConfig", () => {
     expect(merged.integrations.opencodeLocal).toBe(true);
     expect(merged.integrations.opencode).toBe(true);
   });
+
+  test("merges budget and retry objects and replaces fallback order", () => {
+    const merged = mergeConfig(DEFAULTS, {
+      agent: {
+        ...DEFAULTS.agent,
+        budget: { ...DEFAULTS.agent.budget, maxTokens: 5000 },
+        retry: { ...DEFAULTS.agent.retry, attempts: 5 },
+        fallback: ["backup/model"],
+      },
+    });
+    expect(merged.agent.budget.maxTokens).toBe(5000);
+    expect(merged.agent.budget.maxCostUsd).toBe(DEFAULTS.agent.budget.maxCostUsd);
+    expect(merged.agent.retry.attempts).toBe(5);
+    expect(merged.agent.retry.baseDelayMs).toBe(DEFAULTS.agent.retry.baseDelayMs);
+    expect(merged.agent.fallback).toEqual(["backup/model"]);
+  });
 });
 
 describe("resolvePaths and WANDEY_HOME", () => {
@@ -152,6 +168,29 @@ describe("loadConfig", () => {
     const configFile = path.join(home, "config.json");
     fs.writeFileSync(configFile, "{ not json");
     expect(() => loadConfig({ WANDEY_CONFIG: configFile })).toThrow(/Invalid config/);
+  });
+
+  test("normalizes negative limits and cleans fallback refs", () => {
+    const home = tempDir("budget-normalize");
+    const configFile = path.join(home, "config.json");
+    fs.writeFileSync(
+      configFile,
+      JSON.stringify({
+        agent: {
+          budget: { maxTokens: -10, maxCostUsd: 0.25, maxSeconds: -1 },
+          retry: { attempts: 0, baseDelayMs: -5 },
+          fallback: [" backup/model ", "backup/model", "", "other/model"],
+        },
+      }),
+    );
+
+    const loaded = loadConfig({ WANDEY_HOME: home, WANDEY_CONFIG: configFile });
+    expect(loaded.config.agent.budget.maxTokens).toBe(0);
+    expect(loaded.config.agent.budget.maxCostUsd).toBe(0.25);
+    expect(loaded.config.agent.budget.maxSeconds).toBe(0);
+    expect(loaded.config.agent.retry.attempts).toBe(1);
+    expect(loaded.config.agent.retry.baseDelayMs).toBe(0);
+    expect(loaded.config.agent.fallback).toEqual(["backup/model", "other/model"]);
   });
 });
 

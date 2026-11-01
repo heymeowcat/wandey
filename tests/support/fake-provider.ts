@@ -80,6 +80,20 @@ export class FakeRegistry {
     };
   }
 
+  modelInfoSync(ref: string): ModelInfo | null {
+    const model = this.models[ref];
+    if (!model) return null;
+    const provider = ref.split("/")[0] ?? "fake";
+    return {
+      id: ref.slice(provider.length + 1),
+      name: ref,
+      provider,
+      ref,
+      supportsTools: model.supportsTools ?? true,
+      costPerMTok: model.costPerMTok,
+    };
+  }
+
   async *stream(ref: string, request: Omit<ChatRequest, "model">): AsyncGenerator<ProviderEvent> {
     const call = (this.counts.get(ref) ?? 0) + 1;
     this.counts.set(ref, call);

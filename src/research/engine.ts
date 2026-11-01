@@ -59,8 +59,10 @@ export interface ResearchEngineDeps {
 export interface ResearchObserver {
   /** Called synchronously right after the job row is created. */
   onJobCreated?(job: ResearchJob): void;
+  /** Called right before each research model attempt, so usage deltas reset. */
+  onModelAttempt?(model: string): void;
   /** Called after each research model call with provider-reported or estimated usage. */
-  onModelUsage?(model: string, usage: Usage): void;
+  onModelUsage?(model: string, usage: Usage, estimated: boolean): void;
   /** Pages fetched since the previous call, for run budgets. */
   onPagesFetched?(delta: number): void;
   /** Throw to stop research when the outer run budget is exhausted. */
@@ -419,14 +421,15 @@ class ResearchRun {
       this.throwIfAborted();
       return await this.complete(report, cited, outputPath);
     } catch (err) {
+      const budget = (err as Error)?.name === "BudgetExceededError";
       const aborted = this.signal?.aborted || (err as Error)?.name === "AbortError";
-      const message = aborted ? "Stopped by user." : (err as Error).message;
+      const message = budget ? (err as Error).message : aborted ? "Stopped by user." : (err as Error).message;
       this.data.status = "error";
       this.data.error = message;
       this.progressNow("error", message);
       this.stopped = true;
       this.deps.store.updateResearchJob(this.job.id, {
-        status: aborted ? "aborted" : "error",
+        status: budget || !aborted ? "error" : "aborted",
         plan: this.plan,
         error: message,
         state: this.snapshot(),
@@ -607,7 +610,15 @@ class ResearchRun {
 
     let parsed: { restatedQuestion?: unknown; scope?: unknown; subQuestions?: unknown } | null = null;
     try {
-      parsed = await this.planModel.json({ system, prompt, temperature: 0.2, signal: this.signal });
+      this.observer?.assertBudget?.();
+      parsed = await this.planModel.json({
+        system,
+        prompt,
+        temperature: 0.2,
+        signal: this.signal,
+        onAttempt: this.attemptReporter(this.planModel),
+        onUsage: this.usageReporter(this.planModel),
+      });
     } catch (err) {
       this.throwIfAborted(err);
       this.warn(`Planner failed: ${(err as Error).message}`);
@@ -731,6 +742,7 @@ class ResearchRun {
         this.throwIfAborted();
         await this.track(`read: ${hostOf(candidate.url)}`, async () => {
           try {
+            this.observer?.assertBudget?.();
             const page = await this.deps.fetcher.fetch(candidate.url, {
               signal: this.signal,
               maxChars: this.deps.config.crawl.maxCharsPerPage,
@@ -748,6 +760,7 @@ class ResearchRun {
             this.pages.set(candidate.url, { page, source: added.source });
             this.sources.set(added.source.sourceID, added.source);
             this.progress.pagesFetched = this.pages.size;
+            this.observer?.onPagesFetched?.(1);
 
             if (!this.sourceParts.has(added.source.sourceID)) {
               this.sourceParts.add(added.source.sourceID);
@@ -761,6 +774,7 @@ class ResearchRun {
             }
             this.progressNow("crawling", `Read ${this.pages.size} pages`);
             this.checkpoint();
+            this.observer?.assertBudget?.();
           } catch (err) {
             this.throwIfAborted(err);
             this.warn(`Read failed: ${candidate.url} — ${(err as Error).message}`);
@@ -797,11 +811,14 @@ class ResearchRun {
 
         let parsed: { notes?: unknown } | null = null;
         try {
+          this.observer?.assertBudget?.();
           parsed = await this.workerModel.json({
             system,
             prompt,
             temperature: 0.1,
             signal: this.signal,
+            onAttempt: this.attemptReporter(this.workerModel),
+            onUsage: this.usageReporter(this.workerModel),
           });
         } catch (err) {
           this.throwIfAborted(err);
@@ -856,11 +873,14 @@ class ResearchRun {
     });
 
     try {
+      this.observer?.assertBudget?.();
       const parsed = await this.planModel.json<{ subQuestions?: unknown }>({
         system,
         prompt,
         temperature: 0.3,
         signal: this.signal,
+        onAttempt: this.attemptReporter(this.planModel),
+        onUsage: this.usageReporter(this.planModel),
       });
       this.throwIfAborted();
       const followUps = normalizeSubQuestions(
@@ -900,7 +920,15 @@ class ResearchRun {
 
     let raw = "";
     try {
-      raw = await this.synthModel.text({ system, prompt, temperature: 0.35, signal: this.signal });
+      this.observer?.assertBudget?.();
+      raw = await this.synthModel.text({
+        system,
+        prompt,
+        temperature: 0.35,
+        signal: this.signal,
+        onAttempt: this.attemptReporter(this.synthModel),
+        onUsage: this.usageReporter(this.synthModel),
+      });
     } catch (err) {
       this.throwIfAborted(err);
       this.warn(`Synthesis failed: ${(err as Error).message}`);
@@ -1023,8 +1051,19 @@ class ResearchRun {
   }
 
   private throwIfAborted(err?: unknown): void {
+    // Budget failures are terminal; preserve them instead of flattening to an
+    // AbortError so the run can record why it stopped.
+    if ((err as Error)?.name === "BudgetExceededError") throw err;
     if (this.signal?.aborted) throw new DOMException("Aborted", "AbortError");
     if (err && (err as Error)?.name === "AbortError") throw err;
+  }
+
+  private attemptReporter(model: ResearchModel): () => void {
+    return () => this.observer?.onModelAttempt?.(model.ref);
+  }
+
+  private usageReporter(model: ResearchModel): (usage: Usage, estimated: boolean) => void {
+    return (usage, estimated) => this.observer?.onModelUsage?.(model.ref, usage, estimated);
   }
 
 }

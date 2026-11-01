@@ -127,10 +127,17 @@ describe("ResearchEngine resume", () => {
     });
     const message = store.createMessage(session.id, "assistant");
 
+    const attempts: string[] = [];
+    const observed: Array<{ model: string; total: number; estimated: boolean }> = [];
     const outcome = await engine.resume({
       jobID: job.id,
       messageID: message.id,
       model: "test/model",
+      observer: {
+        onModelAttempt: (model) => attempts.push(model),
+        onModelUsage: (model, usage, estimated) =>
+          observed.push({ model, total: usage.total ?? 0, estimated }),
+      },
     });
 
     expect(outcome.report).toContain("Recovered report");
@@ -140,6 +147,10 @@ describe("ResearchEngine resume", () => {
     expect(store.listNotes(job.id)).toHaveLength(1);
     expect(store.getResearchJob(job.id)?.status).toBe("done");
     expect(fs.existsSync(outcome.outputPath)).toBe(true);
+    expect(attempts).toEqual(["test/model"]);
+    expect(observed).toHaveLength(1);
+    expect(observed[0]!.estimated).toBe(true);
+    expect(observed[0]!.total).toBeGreaterThan(0);
 
     const part = store.findResearchPart(session.id, job.id);
     expect(part?.type).toBe("research");
