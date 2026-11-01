@@ -10,6 +10,7 @@ import type {
   ResearchDepth,
   ResearchJob,
   Run,
+  RunCheckpointState,
   RunStatus,
   RunStep,
   RunStepUsage,
@@ -17,6 +18,7 @@ import type {
   Session,
   SourcePartData,
   ToolCallBlock,
+  ToolPartData,
   Usage,
 } from "../core/types.ts";
 import { estimateTokens, normalizeRunBudget } from "../core/run-usage.ts";
@@ -26,7 +28,7 @@ import type { Store } from "../storage/store.ts";
 import type { PageFetcher } from "../crawl/fetcher.ts";
 import type { SearchService } from "../search/search.ts";
 import type { AskRequest, AskResponse, DeepResearchOptions, ToolContext, ToolRegistry, ToolResult } from "../tools/types.ts";
-import { ResearchEngine } from "../research/engine.ts";
+import { ResearchEngine, type ResearchObserver } from "../research/engine.ts";
 import { buildProviderHistory } from "./history.ts";
 import { buildSystemPrompt } from "./prompt.ts";
 
@@ -144,23 +146,123 @@ export class Agent {
     }
     if (updated !== session) bus.publish({ type: "session.updated", session: updated });
 
-    const controller = new AbortController();
-    const active: ActiveRun = { controller, sessionID, runID: run.id, promise: Promise.resolve() };
+    this.startRun(run.id, sessionID, new AbortController());
+
+    return { message: user, run };
+  }
+
+  /**
+   * Continue an interrupted/failed/user-aborted run from its last checkpoint.
+   * Partial model output is discarded, completed tool steps are reused, and a
+   * linked deep-research job resumes instead of starting over.
+   */
+  async resumeRun(runID: string): Promise<Run> {
+    const { store, bus } = this.deps;
+    const run = store.getRun(runID);
+    if (!run) throw new Error(`Run ${runID} not found`);
+    if (run.dismissedAt) throw new Error("This run was dismissed. Start a new prompt instead.");
+    if (run.status === "running" || run.status === "waiting") {
+      throw new Error("This run is already running.");
+    }
+    if (run.status === "completed") throw new Error("This run is already complete.");
+    if (run.stopReason === "budget") {
+      throw new Error("This run stopped because its budget was exhausted. Start a new prompt to continue.");
+    }
+    if (this.runs.has(run.sessionID) || store.activeRun(run.sessionID)) {
+      throw new Error("This session is already running. Abort it or wait for it to finish.");
+    }
+    if (!store.getSession(run.sessionID)) throw new Error("The session for this run no longer exists.");
+
+    // A crash can leave an assistant message with no parts before the first
+    // checkpoint was written. Those rows are noise, not answers.
+    store.deleteEmptyAssistantMessages(run.sessionID);
+
+    const checkpoint = store.latestRunCheckpoint(runID);
+    const state = checkpoint?.state ?? null;
+
+    if (state?.phase === "done") {
+      this.completeInterruptedModelStep(state, run.sessionID);
+      const usage = store.sumRunUsage(runID);
+      const updated = store.updateRun(runID, {
+        status: "completed",
+        stopReason: "completed",
+        error: null,
+        usage,
+        endedAt: run.endedAt ?? now(),
+      });
+      if (updated) bus.publish({ type: "run.updated", sessionID: updated.sessionID, run: updated });
+      return updated ?? run;
+    }
+
+    if (state?.phase === "model" && state.assistantMessageID) {
+      // Delete the partial stream before retrying. This is what prevents a
+      // resumed answer from containing the first half twice.
+      const step = state.modelStepID ? store.getRunStep(state.modelStepID) : null;
+      if (step && step.status !== "completed") {
+        this.finishStep(step, run.sessionID, {
+          status: "failed",
+          error: "Interrupted before completion",
+          endedAt: now(),
+        });
+      }
+      store.deleteMessage(state.assistantMessageID);
+      store.createRunCheckpoint(runID, {
+        version: 1,
+        loopStep: state.loopStep,
+        phase: "model",
+        assistantMessageID: null,
+        modelStepID: null,
+        toolCalls: [],
+        nextToolIndex: 0,
+      });
+    } else if (state?.phase === "tools") {
+      // The checkpoint is written only after the model message and parts are
+      // durable, so a still-running step is complete even if its final update
+      // was lost.
+      this.completeInterruptedModelStep(state, run.sessionID);
+    }
+
+    const usage = store.sumRunUsage(runID);
+    const updated = store.updateRun(runID, {
+      status: "running",
+      error: null,
+      stopReason: null,
+      endedAt: null,
+      usage,
+      resumeCount: run.resumeCount + 1,
+    });
+    if (updated) bus.publish({ type: "run.updated", sessionID: updated.sessionID, run: updated });
+    this.startRun(runID, run.sessionID, new AbortController());
+    return updated ?? run;
+  }
+
+  private startRun(runID: string, sessionID: string, controller: AbortController): void {
+    const active: ActiveRun = { controller, sessionID, runID, promise: Promise.resolve() };
     this.runs.set(sessionID, active);
-    active.promise = this.executeRun(run.id, controller)
+    active.promise = this.executeRun(runID, controller)
       .catch((err) => {
         // executeRun handles its own errors; this is only a guard for the finally.
         if (!controller.signal.aborted) console.error("[agent] unhandled run error:", err);
       })
       .finally(() => {
         this.runs.delete(sessionID);
-        store.touchSession(sessionID);
-        bus.publish({ type: "session.status", sessionID, status: "idle" });
-        const latest = store.getSession(sessionID);
-        if (latest) bus.publish({ type: "session.updated", session: latest });
+        this.deps.store.touchSession(sessionID);
+        this.deps.bus.publish({ type: "session.status", sessionID, status: "idle" });
+        const latest = this.deps.store.getSession(sessionID);
+        if (latest) this.deps.bus.publish({ type: "session.updated", session: latest });
       });
+  }
 
-    return { message: user, run };
+  private completeInterruptedModelStep(state: RunCheckpointState, sessionID: string): void {
+    if (!state.modelStepID) return;
+    const step = this.deps.store.getRunStep(state.modelStepID);
+    if (step?.status === "running") {
+      this.finishStep(step, sessionID, { status: "completed", endedAt: now() });
+    }
+  }
+
+  private nextAttempt(runID: string, stepKey: string): number {
+    return (this.deps.store.latestRunStep(runID, stepKey)?.attempt ?? 0) + 1;
   }
 
   abort(sessionID: string): boolean {
@@ -301,10 +403,73 @@ export class Agent {
       }
 
       const canUseTools = await registry.supportsTools(model);
+      const checkpoint = store.latestRunCheckpoint(runID);
+      let state: RunCheckpointState = checkpoint?.state ?? {
+        version: 1,
+        loopStep: 0,
+        phase: "model",
+        assistantMessageID: null,
+        modelStepID: null,
+        toolCalls: [],
+        nextToolIndex: 0,
+      };
       let finalised = false;
 
-      for (let step = 0; step < config.agent.maxSteps; step++) {
+      while (state.loopStep < config.agent.maxSteps) {
         if (controller.signal.aborted) break;
+
+        if (state.phase === "done") {
+          finalised = true;
+          break;
+        }
+
+        if (state.phase === "tools") {
+          // The checkpoint is written after the model message and parts are
+          // durable, so a still-running step completed even if its final
+          // update was lost.
+          this.completeInterruptedModelStep(state, sessionID);
+          const messageID = state.assistantMessageID;
+          if (!messageID) throw new Error("Run checkpoint is missing its assistant message.");
+          bus.publish({ type: "session.status", sessionID, status: "tool" });
+
+          for (let index = state.nextToolIndex; index < state.toolCalls.length; index++) {
+            if (controller.signal.aborted) break;
+            const call = state.toolCalls[index]!;
+            const completed = await this.runTool(
+              run,
+              messageID,
+              { type: "tool_call", id: call.id, name: call.name, args: call.args },
+              controller,
+              state.loopStep,
+              index,
+              elapsed,
+            );
+            if (!completed) break;
+            state = { ...state, nextToolIndex: index + 1 };
+            store.createRunCheckpoint(runID, state);
+          }
+          if (controller.signal.aborted) break;
+          if (state.nextToolIndex < state.toolCalls.length) break;
+
+          if (state.loopStep >= config.agent.maxSteps - 1) {
+            const message = `Reached the step limit (${config.agent.maxSteps}). The task may be incomplete; raise agent.maxSteps if needed.`;
+            this.addErrorPart(sessionID, messageID, message);
+            terminal = { status: "failed", stopReason: "step_limit", error: message };
+            break;
+          }
+
+          state = {
+            version: 1,
+            loopStep: state.loopStep + 1,
+            phase: "model",
+            assistantMessageID: null,
+            modelStepID: null,
+            toolCalls: [],
+            nextToolIndex: 0,
+          };
+          store.createRunCheckpoint(runID, state);
+          continue;
+        }
 
         const history = buildProviderHistory(store, sessionID, config.agent.contextChars);
         const system = buildSystemPrompt({
@@ -316,16 +481,22 @@ export class Agent {
           model,
         });
 
-        const assistant = store.createMessage(sessionID, "assistant", model);
-        bus.publish({ type: "message.created", sessionID, message: assistant });
-        store.updateRun(runID, { assistantMessageID: assistant.id });
+        const assistant = state.assistantMessageID
+          ? store.getMessage(state.assistantMessageID) ?? store.createMessage(sessionID, "assistant", model)
+          : store.createMessage(sessionID, "assistant", model);
+        if (!state.assistantMessageID) {
+          bus.publish({ type: "message.created", sessionID, message: assistant });
+          store.updateRun(runID, { assistantMessageID: assistant.id });
+        }
         bus.publish({ type: "session.status", sessionID, status: "streaming" });
 
+        const stepKey = `model:${state.loopStep}`;
         const modelStep = store.createRunStep({
           runID,
-          stepKey: `model:${step}`,
+          stepKey,
           kind: "model",
           name: "model",
+          attempt: this.nextAttempt(runID, stepKey),
           model,
           messageID: assistant.id,
           input: traceInput({
@@ -335,6 +506,19 @@ export class Agent {
           }),
         });
         this.publishRunStep(sessionID, modelStep);
+
+        // Save the cursor before streaming so a crash always has a message and
+        // step to clean up instead of a half-written conversation.
+        state = {
+          version: 1,
+          loopStep: state.loopStep,
+          phase: "model",
+          assistantMessageID: assistant.id,
+          modelStepID: modelStep.id,
+          toolCalls: [],
+          nextToolIndex: 0,
+        };
+        store.createRunCheckpoint(runID, state);
 
         let text = "";
         let reasoning = "";
@@ -406,7 +590,7 @@ export class Agent {
             });
           }
         } catch (err) {
-          if (controller.signal.aborted || (err as Error).name === "AbortError") {
+          if (controller.signal.aborted) {
             finishReason = "aborted";
           } else {
             streamError = (err as Error).message;
@@ -443,25 +627,28 @@ export class Agent {
           system.length + historyChars(history.messages),
           text.length + reasoning.length,
         );
+        const traceOutput = truncate(text, TRACE_OUTPUT_CHARS);
 
         if (streamError) {
           this.finishStep(modelStep, sessionID, {
             status: "failed",
             error: streamError,
-            output: truncate(text, TRACE_OUTPUT_CHARS),
+            output: traceOutput,
             usage: stepUsage,
             endedAt: now(),
           });
           this.addErrorPart(sessionID, assistant.id, streamError);
           bus.publish({ type: "session.error", sessionID, message: streamError });
-          terminal = { status: "failed", stopReason: "error", error: streamError };
+          // A mid-stream failure is resumable. Resume deletes this partial
+          // message and retries the same model step with the next attempt.
+          terminal = { status: "interrupted", stopReason: "error", error: streamError };
           break;
         }
         if (controller.signal.aborted) {
           this.finishStep(modelStep, sessionID, {
             status: "aborted",
             error: "Stopped by user.",
-            output: truncate(text, TRACE_OUTPUT_CHARS),
+            output: traceOutput,
             usage: stepUsage,
             endedAt: now(),
           });
@@ -483,31 +670,29 @@ export class Agent {
           break;
         }
 
-        this.finishStep(modelStep, sessionID, {
-          status: "completed",
-          output: truncate(text, TRACE_OUTPUT_CHARS),
-          usage: stepUsage,
-          endedAt: now(),
-        });
+        // Persist the step's output and usage before advancing the checkpoint.
+        // If the process dies between the two writes, resume can trust the
+        // checkpoint and still keep the trace's token counts.
+        store.updateRunStep(modelStep.id, { output: traceOutput, usage: stepUsage });
         this.syncRunUsage(runID, elapsed());
 
         if (calls.length === 0) {
+          state = { ...state, phase: "done" };
+          store.createRunCheckpoint(runID, state);
+          this.finishStep(modelStep, sessionID, { status: "completed", endedAt: now() });
           finalised = true;
           break;
         }
 
-        bus.publish({ type: "session.status", sessionID, status: "tool" });
-        for (let index = 0; index < calls.length; index++) {
-          if (controller.signal.aborted) break;
-          await this.runTool(run, assistant.id, calls[index]!, controller, step, index, elapsed);
-        }
-        if (controller.signal.aborted) break;
-
-        if (step === config.agent.maxSteps - 1) {
-          const message = `Reached the step limit (${config.agent.maxSteps}). The task may be incomplete; raise agent.maxSteps if needed.`;
-          this.addErrorPart(sessionID, assistant.id, message);
-          terminal = { status: "failed", stopReason: "step_limit", error: message };
-        }
+        const normalizedCalls = calls.map((call) => ({
+          id: call.id || newID("call"),
+          name: call.name,
+          args: call.args,
+        }));
+        state = { ...state, phase: "tools", toolCalls: normalizedCalls, nextToolIndex: 0 };
+        store.createRunCheckpoint(runID, state);
+        this.finishStep(modelStep, sessionID, { status: "completed", endedAt: now() });
+        this.syncRunUsage(runID, elapsed());
       }
 
       if (!terminal) {
@@ -575,26 +760,64 @@ export class Agent {
     loopStep: number,
     callIndex: number,
     elapsed: () => number,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const { store, tools, bus } = this.deps;
     const sessionID = run.sessionID;
     const callID = call.id || newID("call");
-    const toolPart = store.addPart(sessionID, messageID, "tool", {
-      callID,
-      name: call.name,
-      args: call.args,
-      status: "running",
-      startedAt: now(),
-    });
-    bus.publish({ type: "part.created", sessionID, messageID, part: toolPart });
+    const stepKey = `tool:${loopStep}:${callIndex}:${callID}`;
+    const existingPart = store
+      .listParts(messageID)
+      .find((part): part is Part & { type: "tool" } => part.type === "tool" && part.data.callID === callID);
+    const existingStep = store.latestRunStep(run.id, stepKey);
+
+    // A completed tool step already has a durable result. Reuse it instead of
+    // calling the tool twice after a resume.
+    if (existingStep?.status === "completed" && existingPart && existingPart.data.status !== "running") {
+      return true;
+    }
+    if (existingStep?.status === "running") {
+      this.finishStep(existingStep, sessionID, {
+        status: "aborted",
+        error: "Interrupted before completion",
+        endedAt: now(),
+      });
+    }
+
+    let toolPart: Part;
+    if (existingPart) {
+      const updated = store.updatePart(existingPart.id, {
+        ...existingPart.data,
+        name: call.name,
+        args: call.args,
+        status: "running",
+        title: undefined,
+        output: undefined,
+        metadata: undefined,
+        endedAt: undefined,
+        startedAt: now(),
+      });
+      toolPart = updated ?? existingPart;
+      bus.publish({ type: "part.updated", sessionID, part: toolPart });
+    } else {
+      toolPart = store.addPart(sessionID, messageID, "tool", {
+        callID,
+        name: call.name,
+        args: call.args,
+        status: "running",
+        startedAt: now(),
+      });
+      bus.publish({ type: "part.created", sessionID, messageID, part: toolPart });
+    }
 
     const step = store.createRunStep({
       runID: run.id,
-      stepKey: `tool:${loopStep}:${callIndex}:${callID}`,
+      stepKey,
       kind: "tool",
       name: call.name,
+      attempt: this.nextAttempt(run.id, stepKey),
       messageID,
       callID,
+      refID: existingStep?.refID ?? null,
       input: traceInput(call.args),
     });
     this.publishRunStep(sessionID, step);
@@ -620,21 +843,32 @@ export class Agent {
       registry: this.deps.registry,
       ask: (request) => this.askUser(sessionID, messageID, request, controller, callID),
       deepResearch: (question, depth, options) =>
-        this.runDeepResearch(sessionID, question, depth, options),
+        this.runDeepResearch(sessionID, question, depth, options, run, step),
     };
 
     try {
       const result = await tools.execute(call.name, call.args, context);
-      const toolData = toolPart.data as import("../core/types.ts").ToolPartData;
+      const toolData = toolPart.data as ToolPartData;
+      const aborted = controller.signal.aborted;
       const updated = store.updatePart(toolPart.id, {
         ...toolData,
-        status: result.isError ? "error" : "done",
+        status: aborted || result.isError ? "error" : "done",
         title: result.title,
         output: result.output,
         metadata: result.metadata,
         endedAt: now(),
       });
       if (updated) bus.publish({ type: "part.updated", sessionID, part: updated });
+
+      if (aborted) {
+        this.finishStep(step, sessionID, {
+          status: "aborted",
+          error: "Stopped by user.",
+          crawlPages,
+          endedAt: now(),
+        });
+        return false;
+      }
 
       if (result.sources && result.sources.length > 0) {
         const existing = new Set(
@@ -656,6 +890,7 @@ export class Agent {
         crawlPages,
         endedAt: now(),
       });
+      return true;
     } catch (err) {
       const message = (err as Error).message;
       this.finishStep(step, sessionID, {
@@ -665,6 +900,7 @@ export class Agent {
         endedAt: now(),
       });
       if (!controller.signal.aborted) throw err;
+      return false;
     } finally {
       this.syncRunUsage(run.id, elapsed());
     }
@@ -675,21 +911,118 @@ export class Agent {
     question: string,
     depth: ResearchDepth | undefined,
     options: DeepResearchOptions,
+    run: Run,
+    step: RunStep,
   ): Promise<ToolResult> {
-    const session = this.deps.store.getSession(sessionID);
+    const { store } = this.deps;
+    const session = store.getSession(sessionID);
+    const model = session?.model ?? this.deps.config.agent.model;
+    const normalized = question.replace(/\s+/g, " ").trim();
+
+    const observer: ResearchObserver = {
+      onJobCreated: (job) => {
+        const updated = store.updateRunStep(step.id, { refID: job.id });
+        if (updated) this.publishRunStep(sessionID, updated);
+      },
+    };
+
+    // A linked job is authoritative: resume it instead of creating a second
+    // research run with the same question.
+    let job = step.refID ? store.getResearchJob(step.refID) : null;
+    if (job?.status === "done") return this.researchJobResult(job, question);
+
+    if (!job) {
+      // Crash window: the job row was inserted but the ref update was lost.
+      job = store.findUnlinkedResearchJob(sessionID, normalized, run.startedAt);
+      if (job) {
+        const updated = store.updateRunStep(step.id, { refID: job.id });
+        if (updated) this.publishRunStep(sessionID, updated);
+      }
+    }
+
+    if (job?.status === "done") return this.researchJobResult(job, question);
+
+    if (job) {
+      const outcome = await this.research.resume({
+        jobID: job.id,
+        messageID: options.messageID,
+        model,
+        signal: options.signal,
+        observer,
+      });
+      return this.researchOutcomeResult(outcome, question);
+    }
+
     const outcome = await this.research.run({
       sessionID,
       messageID: options.messageID,
       question,
       depth,
-      model: session?.model ?? this.deps.config.agent.model,
+      model,
       signal: options.signal,
+      observer,
     });
+    return this.researchOutcomeResult(outcome, question);
+  }
 
+  private researchOutcomeResult(
+    outcome: {
+      job: ResearchJob;
+      report: string;
+      outputPath: string | null;
+      sources: SourcePartData[];
+      cited: string[];
+      notes: number;
+      warnings: string[];
+    },
+    question: string,
+  ): ToolResult {
+    return this.researchResult(
+      question,
+      outcome.job,
+      outcome.report,
+      outcome.outputPath,
+      outcome.sources,
+      outcome.cited,
+      outcome.notes,
+      outcome.warnings,
+    );
+  }
+
+  /** Rebuild a completed job's tool result without another model call. */
+  private researchJobResult(job: ResearchJob, question: string): ToolResult {
+    const report = job.report ?? "";
+    const sourceIDs = new Set(job.state?.pages.map((page) => page.sourceID) ?? []);
+    const sources = this.deps.store
+      .listSources(job.sessionID)
+      .filter((source) => sourceIDs.size === 0 || sourceIDs.has(source.sourceID));
+    const cited = [...new Set([...report.matchAll(/\[(s\d+)\]/g)].map((match) => match[1]!))];
+    return this.researchResult(
+      question,
+      job,
+      report,
+      job.outputPath,
+      sources,
+      cited,
+      this.deps.store.listNotes(job.id).length,
+      job.state?.warnings ?? [],
+    );
+  }
+
+  private researchResult(
+    question: string,
+    job: ResearchJob,
+    report: string,
+    outputPath: string | null,
+    sources: SourcePartData[],
+    cited: string[],
+    notes: number,
+    warnings: string[],
+  ): ToolResult {
     const header = [
-      `Deep research complete: ${outcome.sources.length} sources, ${outcome.notes} evidence notes, ${outcome.cited.length} cited.`,
-      `Report file: ${outcome.outputPath}`,
-      outcome.warnings.length > 0 ? `Warnings: ${outcome.warnings.slice(0, 6).join("; ")}` : "",
+      `Deep research complete: ${sources.length} sources, ${notes} evidence notes, ${cited.length} cited.`,
+      `Report file: ${outputPath ?? "(not saved)"}`,
+      warnings.length > 0 ? `Warnings: ${warnings.slice(0, 6).join("; ")}` : "",
       "",
       "Use the report below to answer the user. Cite its [sN] ids; they match the source cards in this session.",
       "",
@@ -697,18 +1030,18 @@ export class Agent {
 
     return {
       title: `Researched: ${truncate(question, 64)}`,
-      output: truncate(`${header}${outcome.report}`, 48_000),
+      output: truncate(`${header}${report}`, 48_000),
       metadata: {
-        jobID: outcome.job.id,
-        outputPath: outcome.outputPath,
-        sources: outcome.sources.map((source) => ({
+        jobID: job.id,
+        outputPath,
+        sources: sources.map((source) => ({
           sourceID: source.sourceID,
           title: source.title,
           url: source.url,
         })),
-        cited: outcome.cited,
-        notes: outcome.notes,
-        warnings: outcome.warnings,
+        cited,
+        notes,
+        warnings,
       },
     };
   }
@@ -721,6 +1054,23 @@ export class Agent {
     callID?: string,
   ): Promise<AskResponse> {
     const { store, bus } = this.deps;
+
+    // On resume, a question answered before the crash is still valid. A stale
+    // pending question cannot be answered by the old process, so expire it and
+    // ask again with a fresh part.
+    if (callID) {
+      const existing = store
+        .listParts(messageID)
+        .find((part): part is Part & { type: "question" } => part.type === "question" && part.data.callID === callID);
+      if (existing?.data.status === "answered") {
+        return Promise.resolve({ answer: existing.data.answer ?? [], custom: existing.data.custom });
+      }
+      if (existing?.data.status === "pending") {
+        const expired = store.updatePart(existing.id, { ...existing.data, status: "expired" });
+        if (expired) bus.publish({ type: "part.updated", sessionID, part: expired });
+      }
+    }
+
     const questionID = newID("q");
     const data: QuestionPartData = {
       questionID,

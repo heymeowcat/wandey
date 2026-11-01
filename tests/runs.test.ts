@@ -2,7 +2,9 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { Agent } from "../src/agent/agent.ts";
 import { DEFAULTS, type Config } from "../src/core/config.ts";
 import { EventBus } from "../src/core/events.ts";
-import type { ServerEvent } from "../src/core/types.ts";
+import { normalizeRunBudget } from "../src/core/run-usage.ts";
+import type { ResearchDepth, ServerEvent } from "../src/core/types.ts";
+import { now } from "../src/core/util.ts";
 import type { PageFetcher } from "../src/crawl/fetcher.ts";
 import type { SearchService } from "../src/search/search.ts";
 import { Store } from "../src/storage/store.ts";
@@ -184,5 +186,438 @@ describe("Agent run recording", () => {
     await expect(h.agent.prompt(h.sessionID, "Second")).rejects.toThrow("already running");
     release?.();
     await waitForRun(h.store, first.run.id);
+  });
+});
+
+function registerResearchTool(h: Harness): void {
+  h.tools.register({
+    name: "deep_research",
+    description: "Run deep research",
+    parameters: {
+      type: "object",
+      properties: {
+        question: { type: "string" },
+        depth: { type: "string" },
+      },
+    },
+    async execute(args, ctx) {
+      if (!ctx.deepResearch) throw new Error("deep research handler is missing");
+      return ctx.deepResearch(String(args.question ?? ""), args.depth as ResearchDepth | undefined, {
+        messageID: ctx.messageID,
+        callID: ctx.callID,
+        signal: ctx.signal,
+      });
+    },
+  });
+}
+
+/** Build a run stopped in the middle of a deep_research tool call. */
+function interruptedResearchRun(
+  h: Harness,
+  options: { question: string; jobID: string | null },
+): { runID: string; toolStepID: string } {
+  const user = h.store.createMessage(h.sessionID, "user");
+  h.store.addPart(h.sessionID, user.id, "text", { text: "Research this" });
+  const assistant = h.store.createMessage(h.sessionID, "assistant", "fake/model");
+  const run = h.store.createRun({
+    sessionID: h.sessionID,
+    userMessageID: user.id,
+    prompt: "Research this",
+    mode: "chat",
+    model: "fake/model",
+    budget: normalizeRunBudget(undefined),
+  });
+  const modelStep = h.store.createRunStep({
+    runID: run.id,
+    stepKey: "model:0",
+    kind: "model",
+    name: "model",
+    model: "fake/model",
+    messageID: assistant.id,
+  });
+  h.store.updateRunStep(modelStep.id, { status: "completed", endedAt: now() });
+  h.store.addPart(h.sessionID, assistant.id, "tool", {
+    callID: "call_research",
+    name: "deep_research",
+    args: { question: options.question, depth: "quick" },
+    status: "running",
+    startedAt: now(),
+  });
+  const toolStep = h.store.createRunStep({
+    runID: run.id,
+    stepKey: "tool:0:0:call_research",
+    kind: "tool",
+    name: "deep_research",
+    model: "fake/model",
+    messageID: assistant.id,
+    callID: "call_research",
+    refID: options.jobID,
+  });
+  h.store.updateRun(run.id, {
+    assistantMessageID: assistant.id,
+    status: "interrupted",
+    stopReason: "restart",
+    endedAt: now(),
+  });
+  h.store.createRunCheckpoint(run.id, {
+    version: 1,
+    loopStep: 0,
+    phase: "tools",
+    assistantMessageID: assistant.id,
+    modelStepID: modelStep.id,
+    toolCalls: [
+      { id: "call_research", name: "deep_research", args: { question: options.question, depth: "quick" } },
+    ],
+    nextToolIndex: 0,
+  });
+  return { runID: run.id, toolStepID: toolStep.id };
+}
+
+describe("Agent run resume", () => {
+  test("marks a mid-stream provider failure as interrupted", async () => {
+    const h = setup(async function* () {
+      yield { type: "text", delta: "partial" };
+      throw new Error("stream broke");
+    });
+    const { run } = await h.agent.prompt(h.sessionID, "Hi");
+    const done = await waitForRun(h.store, run.id);
+
+    expect(done.status).toBe("interrupted");
+    expect(done.stopReason).toBe("error");
+    expect(done.error).toContain("stream broke");
+    expect(h.store.listRunSteps(run.id)[0]!.status).toBe("failed");
+
+    const detail = h.store.getSessionDetail(h.sessionID)!;
+    const assistant = detail.messages.find((entry) => entry.message.role === "assistant")!;
+    expect(assistant.parts.some((part) => part.type === "text" && part.data.text === "partial")).toBe(true);
+  });
+
+  test("resume deletes partial output and retries the model step", async () => {
+    let calls = 0;
+    const h = setup(async function* () {
+      calls++;
+      if (calls === 1) {
+        yield { type: "text", delta: "partial" };
+        throw new Error("stream broke");
+      }
+      yield { type: "text", delta: "final answer" };
+      yield { type: "finish", reason: "stop" };
+    });
+    const { run } = await h.agent.prompt(h.sessionID, "Hi");
+    await waitForRun(h.store, run.id);
+
+    const resumed = await h.agent.resumeRun(run.id);
+    expect(resumed.status).toBe("running");
+    expect(resumed.resumeCount).toBe(1);
+
+    const done = await waitForRun(h.store, run.id);
+    expect(done.status).toBe("completed");
+    expect(done.stopReason).toBe("completed");
+
+    const attempts = h.store.listRunSteps(run.id).filter((step) => step.stepKey === "model:0");
+    expect(attempts.map((step) => step.status)).toEqual(["failed", "completed"]);
+    expect(attempts.map((step) => step.attempt)).toEqual([1, 2]);
+
+    const detail = h.store.getSessionDetail(h.sessionID)!;
+    const assistants = detail.messages.filter((entry) => entry.message.role === "assistant");
+    expect(assistants).toHaveLength(1);
+    const texts = assistants[0]!.parts.filter((part) => part.type === "text").map((part) => part.data.text);
+    expect(texts).toEqual(["final answer"]);
+  });
+
+  test("resume keeps completed tool steps and continues at the next model step", async () => {
+    let toolRuns = 0;
+    let calls = 0;
+    const h = setup(async function* () {
+      calls++;
+      if (calls === 1) {
+        yield* toolCallResponse([{ id: "call_1", name: "count", args: {} }]);
+        return;
+      }
+      if (calls === 2) {
+        yield { type: "text", delta: "partial" };
+        throw new Error("model broke");
+      }
+      yield { type: "text", delta: "final" };
+      yield { type: "finish", reason: "stop" };
+    });
+    h.tools.register({
+      name: "count",
+      description: "Count calls",
+      parameters: { type: "object", properties: {} },
+      async execute() {
+        toolRuns++;
+        return { title: "Counted", output: `run ${toolRuns}` };
+      },
+    });
+
+    const { run } = await h.agent.prompt(h.sessionID, "Use the tool");
+    const interrupted = await waitForRun(h.store, run.id);
+    expect(interrupted.status).toBe("interrupted");
+    expect(toolRuns).toBe(1);
+
+    await h.agent.resumeRun(run.id);
+    const done = await waitForRun(h.store, run.id);
+    expect(done.status).toBe("completed");
+    expect(toolRuns).toBe(1);
+
+    const steps = h.store.listRunSteps(run.id);
+    expect(steps.filter((step) => step.stepKey === "model:0")).toHaveLength(1);
+    expect(steps.filter((step) => step.stepKey === "tool:0:0:call_1")).toHaveLength(1);
+    expect(steps.filter((step) => step.stepKey === "model:1").map((step) => step.status)).toEqual([
+      "failed",
+      "completed",
+    ]);
+  });
+
+  test("resume re-runs a tool that was aborted by the user", async () => {
+    let slowRuns = 0;
+    let started!: () => void;
+    const startedPromise = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    let calls = 0;
+    const h = setup(async function* () {
+      calls++;
+      if (calls === 1) {
+        yield* toolCallResponse([{ id: "call_slow", name: "slow", args: {} }]);
+        return;
+      }
+      yield { type: "text", delta: "done" };
+      yield { type: "finish", reason: "stop" };
+    });
+    h.tools.register({
+      name: "slow",
+      description: "Wait for an abort",
+      parameters: { type: "object", properties: {} },
+      async execute(_args, ctx) {
+        slowRuns++;
+        if (slowRuns > 1) return { title: "Slow", output: "slow finished" };
+        started();
+        await new Promise<void>((resolve) => {
+          if (ctx.signal.aborted) resolve();
+          else ctx.signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+        throw new DOMException("Aborted", "AbortError");
+      },
+    });
+
+    const { run } = await h.agent.prompt(h.sessionID, "Use the slow tool");
+    await startedPromise;
+    h.agent.abort(h.sessionID);
+    const aborted = await waitForRun(h.store, run.id);
+    expect(aborted.status).toBe("aborted");
+    expect(aborted.stopReason).toBe("user");
+    expect(
+      h.store.listRunSteps(run.id).find((step) => step.stepKey === "tool:0:0:call_slow")?.status,
+    ).toBe("aborted");
+
+    await h.agent.resumeRun(run.id);
+    const done = await waitForRun(h.store, run.id);
+    expect(done.status).toBe("completed");
+    expect(slowRuns).toBe(2);
+    expect(
+      h.store
+        .listRunSteps(run.id)
+        .filter((step) => step.stepKey === "tool:0:0:call_slow")
+        .map((step) => step.status),
+    ).toEqual(["aborted", "completed"]);
+    expect(h.store.listRunSteps(run.id).filter((step) => step.stepKey === "model:0")).toHaveLength(1);
+  });
+
+  test("resume finishes a run whose checkpoint is already done", async () => {
+    const h = setup(() => textResponse("unused"));
+    const user = h.store.createMessage(h.sessionID, "user");
+    h.store.addPart(h.sessionID, user.id, "text", { text: "Hi" });
+    const assistant = h.store.createMessage(h.sessionID, "assistant", "fake/model");
+    const run = h.store.createRun({
+      sessionID: h.sessionID,
+      userMessageID: user.id,
+      prompt: "Hi",
+      mode: "chat",
+      model: "fake/model",
+      budget: normalizeRunBudget(undefined),
+    });
+    const step = h.store.createRunStep({
+      runID: run.id,
+      stepKey: "model:0",
+      kind: "model",
+      name: "model",
+      messageID: assistant.id,
+    });
+    h.store.updateRun(run.id, {
+      assistantMessageID: assistant.id,
+      status: "interrupted",
+      stopReason: "restart",
+      endedAt: now(),
+    });
+    h.store.createRunCheckpoint(run.id, {
+      version: 1,
+      loopStep: 0,
+      phase: "done",
+      assistantMessageID: assistant.id,
+      modelStepID: step.id,
+      toolCalls: [],
+      nextToolIndex: 0,
+    });
+
+    const resumed = await h.agent.resumeRun(run.id);
+    expect(resumed.status).toBe("completed");
+    expect(h.registry.calls).toHaveLength(0);
+    expect(h.store.getRunStep(step.id)?.status).toBe("completed");
+  });
+
+  test("resume reuses a linked completed research job", async () => {
+    const h = setup(() => textResponse("final answer"));
+    registerResearchTool(h);
+    const job = h.store.createResearchJob({
+      sessionID: h.sessionID,
+      question: "What changed?",
+      depth: "quick",
+    });
+    h.store.updateResearchJob(job.id, {
+      status: "done",
+      report: "# Report\n\nIt changed [s1].",
+      outputPath: "/tmp/report.md",
+    });
+    const { runID, toolStepID } = interruptedResearchRun(h, {
+      question: "What changed?",
+      jobID: job.id,
+    });
+
+    await h.agent.resumeRun(runID);
+    const done = await waitForRun(h.store, runID);
+    expect(done.status).toBe("completed");
+    expect(h.store.listResearchJobs(h.sessionID)).toHaveLength(1);
+
+    expect(h.store.getRunStep(toolStepID)?.status).toBe("aborted");
+    const step = h.store.latestRunStep(runID, "tool:0:0:call_research")!;
+    expect(step.status).toBe("completed");
+    expect(step.attempt).toBe(2);
+    expect(step.refID).toBe(job.id);
+    expect(step.output).toContain("It changed");
+
+    const toolPart = h.store
+      .getSessionDetail(h.sessionID)!
+      .messages.flatMap((entry) => entry.parts)
+      .find((part) => part.type === "tool" && part.data.callID === "call_research");
+    expect(toolPart?.type).toBe("tool");
+    if (toolPart?.type === "tool") expect(toolPart.data.output).toContain("It changed");
+  });
+
+  test("resume links an unlinked completed research job instead of starting another", async () => {
+    const h = setup(() => textResponse("final answer"));
+    registerResearchTool(h);
+    const { runID, toolStepID } = interruptedResearchRun(h, {
+      question: "What changed?",
+      jobID: null,
+    });
+    const job = h.store.createResearchJob({
+      sessionID: h.sessionID,
+      question: "What changed?",
+      depth: "quick",
+    });
+    h.store.updateResearchJob(job.id, {
+      status: "done",
+      report: "# Report\n\nRecovered [s1].",
+      outputPath: "/tmp/report.md",
+    });
+
+    await h.agent.resumeRun(runID);
+    const done = await waitForRun(h.store, runID);
+    expect(done.status).toBe("completed");
+    expect(h.store.listResearchJobs(h.sessionID)).toHaveLength(1);
+    expect(h.store.getRunStep(toolStepID)?.status).toBe("aborted");
+    expect(h.store.latestRunStep(runID, "tool:0:0:call_research")?.refID).toBe(job.id);
+  });
+
+  test("resume reuses an answered question instead of asking again", async () => {
+    const h = setup(() => textResponse("final"));
+    h.tools.register({
+      name: "ask",
+      description: "Ask the user",
+      parameters: { type: "object", properties: {} },
+      async execute(_args, ctx) {
+        const response = await ctx.ask({
+          question: "Proceed?",
+          options: [{ label: "Yes" }, { label: "No" }],
+        });
+        return { title: "Asked", output: `answer:${response.answer.join(",")}` };
+      },
+    });
+
+    const user = h.store.createMessage(h.sessionID, "user");
+    h.store.addPart(h.sessionID, user.id, "text", { text: "Ask me" });
+    const assistant = h.store.createMessage(h.sessionID, "assistant", "fake/model");
+    const run = h.store.createRun({
+      sessionID: h.sessionID,
+      userMessageID: user.id,
+      prompt: "Ask me",
+      mode: "chat",
+      model: "fake/model",
+      budget: normalizeRunBudget(undefined),
+    });
+    const modelStep = h.store.createRunStep({
+      runID: run.id,
+      stepKey: "model:0",
+      kind: "model",
+      name: "model",
+      messageID: assistant.id,
+    });
+    h.store.updateRunStep(modelStep.id, { status: "completed", endedAt: now() });
+    h.store.addPart(h.sessionID, assistant.id, "tool", {
+      callID: "call_ask",
+      name: "ask",
+      args: {},
+      status: "running",
+      startedAt: now(),
+    });
+    h.store.addPart(h.sessionID, assistant.id, "question", {
+      questionID: "q_saved",
+      question: "Proceed?",
+      options: [{ label: "Yes" }, { label: "No" }],
+      multiple: false,
+      allowCustom: true,
+      callID: "call_ask",
+      status: "answered",
+      answer: ["Yes"],
+    });
+    h.store.createRunStep({
+      runID: run.id,
+      stepKey: "tool:0:0:call_ask",
+      kind: "tool",
+      name: "ask",
+      messageID: assistant.id,
+      callID: "call_ask",
+    });
+    h.store.updateRun(run.id, {
+      assistantMessageID: assistant.id,
+      status: "interrupted",
+      stopReason: "restart",
+      endedAt: now(),
+    });
+    h.store.createRunCheckpoint(run.id, {
+      version: 1,
+      loopStep: 0,
+      phase: "tools",
+      assistantMessageID: assistant.id,
+      modelStepID: modelStep.id,
+      toolCalls: [{ id: "call_ask", name: "ask", args: {} }],
+      nextToolIndex: 0,
+    });
+
+    await h.agent.resumeRun(run.id);
+    const done = await waitForRun(h.store, run.id);
+    expect(done.status).toBe("completed");
+
+    const step = h.store.latestRunStep(run.id, "tool:0:0:call_ask")!;
+    expect(step.status).toBe("completed");
+    expect(step.output).toContain("answer:Yes");
+    const questions = h.store
+      .getSessionDetail(h.sessionID)!
+      .messages.flatMap((entry) => entry.parts)
+      .filter((part) => part.type === "question");
+    expect(questions).toHaveLength(1);
+    if (questions[0]?.type === "question") expect(questions[0].data.status).toBe("answered");
   });
 });

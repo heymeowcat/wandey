@@ -241,6 +241,7 @@ describe("ResearchEngine resume", () => {
       bus: new EventBus(),
     });
 
+    const observed: string[] = [];
     const promise = abortingEngine.run({
       sessionID: session.id,
       messageID: message.id,
@@ -248,12 +249,16 @@ describe("ResearchEngine resume", () => {
       depth: "quick",
       model: "test/model",
       signal: controller.signal,
+      observer: {
+        onJobCreated: (job) => observed.push(job.id),
+      },
     });
     await expect(promise).rejects.toThrow();
 
     const job = store.findResearchPart(session.id, "missing");
     expect(job).toBeNull();
     const saved = store.listResearchJobs(session.id)[0]!;
+    expect(observed).toEqual([saved.id]);
     expect(saved.status).toBe("aborted");
     expect(saved.error).toBe("Stopped by user.");
     expect(saved.state).not.toBeNull();

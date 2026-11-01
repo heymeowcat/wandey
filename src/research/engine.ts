@@ -17,6 +17,7 @@ import type {
   ResearchRoundState,
   SourcePartData,
   SubQuestion,
+  Usage,
 } from "../core/types.ts";
 import { canonicalURL, hostOf } from "../core/url.ts";
 import { mapLimit, newID, now, slugify, truncate, wordCount } from "../core/util.ts";
@@ -51,6 +52,21 @@ export interface ResearchEngineDeps {
   bus: EventBus;
 }
 
+/**
+ * Optional hooks that let the outer agent run ledger observe research work.
+ * Research stays usable on its own: every hook is optional.
+ */
+export interface ResearchObserver {
+  /** Called synchronously right after the job row is created. */
+  onJobCreated?(job: ResearchJob): void;
+  /** Called after each research model call with provider-reported or estimated usage. */
+  onModelUsage?(model: string, usage: Usage): void;
+  /** Pages fetched since the previous call, for run budgets. */
+  onPagesFetched?(delta: number): void;
+  /** Throw to stop research when the outer run budget is exhausted. */
+  assertBudget?(): void;
+}
+
 export interface ResearchInput {
   sessionID: string;
   messageID: string;
@@ -59,6 +75,7 @@ export interface ResearchInput {
   /** Model resolved for the active chat session. */
   model?: string;
   signal?: AbortSignal;
+  observer?: ResearchObserver;
 }
 
 export interface ResearchResumeInput {
@@ -67,6 +84,7 @@ export interface ResearchResumeInput {
   /** Overrides the model recorded in the checkpoint (e.g. after switching). */
   model?: string;
   signal?: AbortSignal;
+  observer?: ResearchObserver;
 }
 
 export interface ResearchOutcome {
@@ -125,6 +143,9 @@ export class ResearchEngine {
     const model = await this.pickModel(input.model);
     const settings = settingsFor(this.deps.config, depth);
     const job = this.deps.store.createResearchJob({ sessionID: input.sessionID, question, depth });
+    // The observer runs before any research work starts. This closes the crash
+    // window between creating the job and linking it from the outer run step.
+    input.observer?.onJobCreated?.(job);
 
     const progress: ResearchProgress = {
       stage: "planning",
@@ -209,6 +230,7 @@ export class ResearchEngine {
         depth,
         model,
         signal: input.signal,
+        observer: input.observer,
       },
       { ...job, status: "running", error: null },
       part,
@@ -262,6 +284,7 @@ class ResearchRun {
   private readonly workerModel: ResearchModel;
   private readonly synthModel: ResearchModel;
   private readonly model: string;
+  private readonly observer?: ResearchObserver;
 
   private plan: ResearchPlan | null = null;
   private readonly allQuestions: SubQuestion[] = [];
@@ -292,6 +315,7 @@ class ResearchRun {
     this.settings = settings;
     this.signal = input.signal;
     this.model = model;
+    this.observer = input.observer;
     this.planModel = new ResearchModel(deps.registry, deps.config.research.planModel.trim() || model);
     this.workerModel = new ResearchModel(deps.registry, deps.config.research.workerModel.trim() || model);
     this.synthModel = new ResearchModel(deps.registry, deps.config.research.synthModel.trim() || model);
