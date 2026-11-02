@@ -67,6 +67,11 @@
           </div>
 
           <div class="topbar-actions">
+            <button id="run-trace-button" class="icon-button" type="button" title="Open run trace" aria-label="Open run trace" hidden>
+              <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M4 19V5M4 19h16M8 15l3-4 3 2 4-6" />
+              </svg>
+            </button>
             <span id="connection" class="connection-dot offline" title="Connecting…"></span>
             <button id="theme-toggle" class="icon-button" type="button" title="Switch theme" aria-label="Switch theme">
               <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
@@ -86,6 +91,8 @@
             </button>
           </div>
         </header>
+
+        <section id="run-strip" class="run-strip" hidden></section>
 
         <div id="chat" class="chat"></div>
 

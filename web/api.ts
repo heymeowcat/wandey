@@ -3,6 +3,9 @@ import type {
   ModelInfo,
   ResearchJob,
   ResearchPartData,
+  Run,
+  RunCheckpoint,
+  RunStep,
   Session,
   SessionDetail,
   SessionMode,
@@ -79,6 +82,14 @@ export interface ProviderUpsert {
 export interface LoadedSessionDetail extends SessionDetail {
   /** Present after a page reload while the agent is still working. */
   running?: boolean;
+  /** Recent runs, newest first, including dismissed ones. */
+  runs?: Run[];
+}
+
+export interface RunDetail {
+  run: Run;
+  steps: RunStep[];
+  checkpoints: RunCheckpoint[];
 }
 
 export interface ModelsResponse {
@@ -162,10 +173,18 @@ export const api = {
     request<{ ok: boolean }>(`/api/sessions/${encodeURIComponent(id)}`, { method: "DELETE" }),
 
   prompt: (id: string, text: string, options: { model?: string; mode?: SessionMode } = {}) =>
-    request<{ message: Message }>(`/api/sessions/${encodeURIComponent(id)}/prompt`, {
+    request<{ message: Message; run: Run }>(`/api/sessions/${encodeURIComponent(id)}/prompt`, {
       method: "POST",
       body: JSON.stringify({ text, ...options }),
     }),
+
+  run: (id: string) => request<RunDetail>(`/api/runs/${encodeURIComponent(id)}`),
+
+  resumeRun: (id: string) =>
+    request<{ run: Run }>(`/api/runs/${encodeURIComponent(id)}/resume`, { method: "POST" }),
+
+  dismissRun: (id: string) =>
+    request<{ run: Run }>(`/api/runs/${encodeURIComponent(id)}/dismiss`, { method: "POST" }),
 
   abort: (id: string) =>
     request<{ aborted: boolean }>(`/api/sessions/${encodeURIComponent(id)}/abort`, { method: "POST" }),
@@ -200,9 +219,10 @@ export const api = {
     }>(`/api/research/${encodeURIComponent(jobID)}`),
 
   resumeResearch: (jobID: string) =>
-    request<{ message: Message }>(`/api/research/${encodeURIComponent(jobID)}/resume`, {
-      method: "POST",
-    }),
+    request<{ message: Message | null; run: Run | null }>(
+      `/api/research/${encodeURIComponent(jobID)}/resume`,
+      { method: "POST" },
+    ),
 };
 
 /** The research part card needs this narrow helper for dashboard labels. */

@@ -5,6 +5,7 @@ import type {
   Part,
   QuestionPartData,
   ResearchJob,
+  Run,
   ServerEvent,
   Session,
   SessionMode,
@@ -27,6 +28,12 @@ import { icon } from "./icons.ts";
 import { setMarkdown } from "./markdown.ts";
 import { openModelPicker } from "./model-picker.ts";
 import { openProviderModal } from "./providers.ts";
+import {
+  openRunTrace,
+  renderRunStrip as buildRunStrip,
+  selectRun,
+  type RunTraceHandle,
+} from "./runs.ts";
 
 /**
  * The browser controller.
@@ -81,6 +88,8 @@ const els = {
   modelButtonMeta: $("model-button-meta"),
   modelButtonBadges: $("model-button-badges"),
   themeToggle: $<HTMLButtonElement>("theme-toggle"),
+  runTraceButton: $<HTMLButtonElement>("run-trace-button"),
+  runStrip: $("run-strip"),
   chat: $("chat"),
   composerInput: $<HTMLTextAreaElement>("composer-input"),
   sendButton: $<HTMLButtonElement>("send-button"),
@@ -96,6 +105,7 @@ let activeQuestion: { sessionID: string; part: QuestionPartData } | null = null;
 let questionModal: ModalHandle | null = null;
 const partTimers = new Map<string, number>();
 const notifiedJobs = new Set<string>();
+let activeTrace: RunTraceHandle | null = null;
 
 // ---------------------------------------------------------------------------
 // Boot
@@ -166,6 +176,8 @@ async function loadSession(id: string): Promise<void> {
   try {
     const detail = await api.session(id);
     closeQuestionModal();
+    activeTrace?.close();
+    detail.runs ??= [];
     state.detail = detail;
     state.running = Boolean(detail.running);
     state.status = state.running ? "streaming" : "idle";
@@ -213,6 +225,7 @@ async function createSession(): Promise<void> {
 function renderAll(): void {
   renderSidebar();
   renderHeader();
+  renderRunStrip();
   renderModelButton();
   renderChat();
   renderComposer();
@@ -348,6 +361,7 @@ function applySessionUpdate(session: Session): void {
   }
   renderSidebar();
   renderHeader();
+  renderRunStrip();
   renderComposer();
 }
 
@@ -368,10 +382,12 @@ async function sendPrompt(): Promise<void> {
   renderComposer();
 
   try {
-    await api.prompt(session.id, text, {
+    const { run } = await api.prompt(session.id, text, {
       model: state.selectedModel || undefined,
       mode: els.researchMode.checked ? "research" : "chat",
     });
+    upsertRun(run);
+    renderRunStrip();
     if (!state.connected) startPolling();
   } catch (err) {
     state.running = false;
@@ -400,7 +416,11 @@ async function resumeResearch(jobID: string): Promise<void> {
     return;
   }
   try {
-    await api.resumeResearch(jobID);
+    const { run } = await api.resumeResearch(jobID);
+    if (run) {
+      upsertRun(run);
+      renderRunStrip();
+    }
     state.running = true;
     state.status = "streaming";
     renderHeader();
@@ -411,6 +431,76 @@ async function resumeResearch(jobID: string): Promise<void> {
   } catch (err) {
     showToast("error", `Could not resume: ${(err as Error).message}`);
   }
+}
+
+async function resumeRun(runID: string): Promise<void> {
+  try {
+    const { run } = await api.resumeRun(runID);
+    upsertRun(run);
+    state.running = true;
+    state.status = "streaming";
+    renderRunStrip();
+    renderHeader();
+    renderComposer();
+    showToast("info", "Resuming from the last checkpoint…");
+    await reloadCurrent();
+    if (!state.connected) startPolling();
+  } catch (err) {
+    showToast("error", `Could not resume the run: ${(err as Error).message}`);
+  }
+}
+
+async function dismissRun(runID: string): Promise<void> {
+  try {
+    const { run } = await api.dismissRun(runID);
+    upsertRun(run);
+    renderRunStrip();
+    showToast("info", "Run dismissed. Its trace is still available from the header.");
+  } catch (err) {
+    showToast("error", `Could not dismiss the run: ${(err as Error).message}`);
+  }
+}
+
+async function openTrace(runID: string): Promise<void> {
+  if (activeTrace?.runID === runID) return;
+  activeTrace?.close();
+  let handle: RunTraceHandle | null = null;
+  handle = await openRunTrace({
+    runID,
+    onClose: () => {
+      if (activeTrace === handle) activeTrace = null;
+    },
+  });
+  activeTrace = handle;
+}
+
+function upsertRun(run: Run): void {
+  if (!state.detail || run.sessionID !== state.detail.session.id) return;
+  const runs = state.detail.runs ?? [];
+  const index = runs.findIndex((entry) => entry.id === run.id);
+  if (index === -1) runs.push(run);
+  else runs[index] = run;
+  runs.sort((a, b) => b.startedAt - a.startedAt);
+  state.detail.runs = runs;
+}
+
+function renderRunStrip(): void {
+  const run = selectRun(state.detail?.runs ?? []);
+  const visible = Boolean(run && !run.dismissedAt);
+  els.runStrip.hidden = !visible;
+  clear(els.runStrip);
+  if (run && visible) {
+    els.runStrip.append(
+      buildRunStrip(run, {
+        onTrace: (id) => void openTrace(id),
+        onResume: (id) => void resumeRun(id),
+        onDismiss: (id) => void dismissRun(id),
+      }),
+    );
+  }
+  // Keep the trace reachable when the strip is hidden because the run was dismissed.
+  els.runTraceButton.hidden = !run || visible;
+  els.runTraceButton.title = run ? `Open trace · ${run.id}` : "Open run trace";
 }
 
 async function selectModel(ref: string): Promise<void> {
@@ -657,6 +747,21 @@ function applyEvent(event: ServerEvent): void {
       break;
     }
 
+    case "run.created":
+    case "run.updated": {
+      upsertRun(event.run);
+      renderRunStrip();
+      renderHeader();
+      renderComposer();
+      if (activeTrace?.runID === event.run.id) activeTrace.update(event.run);
+      break;
+    }
+
+    case "run.step": {
+      if (activeTrace?.runID === event.runID) activeTrace.addStep(event.step);
+      break;
+    }
+
     case "question": {
       if (event.part.type === "question") showQuestion(event.part.data, event.sessionID);
       break;
@@ -740,6 +845,7 @@ async function reloadCurrent(): Promise<void> {
   if (!id) return;
   try {
     const detail = await api.session(id);
+    detail.runs ??= [];
     state.detail = detail;
     state.running = Boolean(detail.running);
     renderAll();
@@ -1113,6 +1219,10 @@ function bindEvents(): void {
   els.researchMode.addEventListener("change", () => void changeMode());
   els.dashboardButton.addEventListener("click", () => void openDashboard());
   els.themeToggle.addEventListener("click", toggleTheme);
+  els.runTraceButton.addEventListener("click", () => {
+    const run = selectRun(state.detail?.runs ?? []);
+    if (run) void openTrace(run.id);
+  });
   els.sessionTitle.addEventListener("dblclick", () => void renameSession());
 
   els.toggleSidebar.addEventListener("click", () => {
