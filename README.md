@@ -30,6 +30,7 @@ Wandey is early software. Expect sharp edges, and read the code if you plan to r
 - [Search](#search)
 - [Crawling](#crawling)
 - [Deep research](#deep-research)
+- [Durable runs, budgets, and retries](#durable-runs-budgets-and-retries)
 - [Browser UI](#browser-ui)
 - [CLI](#cli)
 - [Configuration](#configuration)
@@ -441,6 +442,10 @@ Checkpoints live in the `research_job.state` column and include the plan, questi
 candidate URLs, page-to-source mappings, completed questions, warnings, and progress. Note
 text and page bodies remain in their own tables, so a checkpoint stays small.
 
+When deep research is started from a chat or agent tool call, the run ledger links the tool
+step to the research job. Resuming that run reuses the same job instead of starting a second
+investigation. See [Durable runs](#durable-runs-budgets-and-retries).
+
 ### Research settings
 
 | Key | Default | Meaning |
@@ -466,6 +471,86 @@ A standard run commonly takes one to several minutes and produces dozens of sour
 quality depends heavily on the model's ability to plan and extract; smaller models often
 need the fallback path.
 
+## Durable runs, budgets, and retries
+
+Every prompt starts a durable **run**. The run, each model and tool step, and each checkpoint
+are written to SQLite as the agent works. If the process dies or you stop a turn, the run is
+marked resumable and the **Resume** action continues from the last checkpoint. Completed tool
+calls are reused, partial model output is discarded, and the run's token and cost accounting
+is preserved.
+
+The web UI shows a run strip above the conversation with status, model, elapsed time, and a
+budget meter. **Trace** opens the full ledger: summary, configured budgets, every attempt,
+tool arguments and output, usage, errors, and linked deep-research jobs. Dismissing a run
+hides it from the active session while keeping it available by run id.
+
+Runs are also available through the API:
+
+```sh
+curl http://127.0.0.1:4319/api/sessions/<session-id>   # includes recent runs
+curl http://127.0.0.1:4319/api/runs/<run-id>           # run, steps, checkpoints
+curl -X POST http://127.0.0.1:4319/api/runs/<run-id>/resume
+curl -X POST http://127.0.0.1:4319/api/runs/<run-id>/dismiss
+```
+
+### Budgets
+
+Configure limits in `agent.budget`. All values are optional; `0` means unlimited.
+
+```json
+{
+  "agent": {
+    "budget": {
+      "maxTokens": 500000,
+      "maxCostUsd": 0.25,
+      "maxSeconds": 900,
+      "maxToolCalls": 40,
+      "maxCrawlPages": 120
+    }
+  }
+}
+```
+
+| Key | Counts |
+| --- | --- |
+| `maxTokens` | Input and output tokens across every model attempt. |
+| `maxCostUsd` | Provider-reported cost, or an estimate from catalog pricing. |
+| `maxSeconds` | Active wall-clock time across resumes, excluding server downtime. |
+| `maxToolCalls` | Top-level tool calls; one `deep_research` call counts as one. |
+| `maxCrawlPages` | Pages fetched by `fetch_url`, `crawl_site`, and deep research. |
+
+The budget is snapshotted when the run starts, so editing config does not change work already
+in progress. A budget stop is terminal: the strip says **Budget stopped**, the trace keeps
+the accounting, and you start a new prompt with a larger budget instead of resuming a run
+that would immediately stop again. An interrupted, failed, or user-stopped run is resumable.
+
+### Retries and fallback
+
+Transient provider failures are retried before any content reaches the conversation. Once a
+stream has produced text, Wandey stops and marks the run resumable instead of silently
+concatenating a retry onto partial output.
+
+```json
+{
+  "agent": {
+    "retry": { "attempts": 3, "baseDelayMs": 700 },
+    "fallback": ["openrouter/google/gemma-4-31b-it:free", "ollama/qwen3:8b"]
+  }
+}
+```
+
+- `retry.attempts` is the number of attempts per candidate. `1` disables retries.
+- `retry.baseDelayMs` grows exponentially with jitter and caps at 8 seconds.
+- `fallback` is an ordered list of model refs. Each fallback is tried only when the primary
+  has produced no content yet.
+- Retries cover timeouts, network errors, `408`, `425`, `429`, `500`, `502`, `503`, and `504`.
+  Client errors such as `400`, `401`, `403`, and `404` are not retried.
+- A fallback without tool support runs text-only with a prompt rebuilt without tool schemas.
+
+Deep research uses the same policy for `research.planModel`, `research.workerModel`, and
+`research.synthModel`. Provider usage is reported to the run ledger; when a provider omits
+usage, Wandey estimates tokens from the prompt and output and marks the trace as estimated.
+
 ## Browser UI
 
 Start the server and open the URL:
@@ -485,6 +570,7 @@ The UI is intentionally close to a small IDE chat:
 - question modal with selectable options, multiple choice, custom text, and skip;
 - deep-research progress card and full report viewer;
 - research dashboard with jobs, plans, evidence notes, and source chips;
+- durable run strip with status, budget meter, Resume, Dismiss, and a full step trace;
 - model picker, provider summary, reconnect indicator, and light/dark theme;
 - provider manager with a Local runtime toggle for OpenCode free models;
 - responsive layout for narrow windows.
@@ -610,6 +696,14 @@ data home too.
 | `agent.autoTitle` | `true` | Derive session titles from the first prompt. |
 | `agent.systemExtra` | `""` | Extra instructions appended to the research system prompt. |
 | `agent.streamReasoning` | `true` | Request and display reasoning when available. |
+| `agent.budget.maxTokens` | `0` | Token limit across a run. `0` is unlimited. |
+| `agent.budget.maxCostUsd` | `0` | Cost limit in USD across a run. |
+| `agent.budget.maxSeconds` | `0` | Active wall-clock limit across a run. |
+| `agent.budget.maxToolCalls` | `0` | Top-level tool-call limit across a run. |
+| `agent.budget.maxCrawlPages` | `0` | Crawl-page limit across a run. |
+| `agent.retry.attempts` | `3` | Attempts per model candidate before fallback. |
+| `agent.retry.baseDelayMs` | `700` | Base delay for exponential retry backoff. |
+| `agent.fallback` | `[]` | Ordered model refs tried before content streams. |
 
 ### Other sections
 
@@ -640,8 +734,8 @@ By default:
 ```
 
 The database stores sessions, messages, parts (text, reasoning, tool calls, questions,
-sources, research parts, errors), saved pages, research jobs, evidence notes, and small
-settings. Foreign keys cascade on session deletion.
+sources, research parts, errors), saved pages, research jobs, evidence notes, durable runs,
+run steps, checkpoints, and small settings. Foreign keys cascade on session deletion.
 
 Sources are session-scoped and numbered `s1`, `s2`, ... A citation chip resolves to the
 stored page through the session, not to a live URL. This keeps reports reproducible after
@@ -666,23 +760,27 @@ network.
 | `GET` | `/api/config` | Redacted config and paths. |
 | `GET` | `/api/sessions` | List sessions. |
 | `POST` | `/api/sessions` | Create a session (`title`, `mode`, `model`). |
-| `GET` | `/api/sessions/:id` | Session detail with messages, parts, and `running`. |
+| `GET` | `/api/sessions/:id` | Session detail with messages, parts, recent `runs`, and `running`. |
 | `PATCH` | `/api/sessions/:id` | Update title, model, mode, or archived. |
 | `DELETE` | `/api/sessions/:id` | Abort and delete a session. |
-| `POST` | `/api/sessions/:id/prompt` | Start a run (`text`, `model`, `mode`). |
+| `POST` | `/api/sessions/:id/prompt` | Start a run (`text`, `model`, `mode`); returns the run. |
 | `POST` | `/api/sessions/:id/abort` | Abort the active run. |
 | `POST` | `/api/sessions/:id/answer` | Answer a pending question. |
 | `GET` | `/api/sessions/:id/research` | List research jobs for a session. |
 | `GET` | `/api/sessions/:id/sources/:sourceID` | Full saved source content. |
+| `GET` | `/api/runs/:id` | Run, steps, and checkpoints. |
+| `POST` | `/api/runs/:id/resume` | Resume an interrupted, failed, or user-stopped run. |
+| `POST` | `/api/runs/:id/dismiss` | Hide a stopped run from the session. |
 | `GET` | `/api/research/:jobID` | Job, notes, and sources. |
 | `POST` | `/api/research/:jobID/resume` | Resume an aborted or interrupted job. |
 | `GET` | `/ws` | WebSocket for session events. |
 
 The WebSocket sends a `hello` event and then streams `session.updated`, `message.created`,
 `part.created`, `part.delta`, `part.updated`, `session.status`, `session.error`,
-`question`, `question.done`, `research.progress`, `crawl.progress`, and
-`session.deleted` events. Client messages subscribe to a session, send prompts or aborts,
-and answer questions. See `src/core/types.ts` for the exact shapes.
+`question`, `question.done`, `research.progress`, `crawl.progress`, `run.created`,
+`run.updated`, `run.step`, and `session.deleted` events. Client messages subscribe to a
+session, send prompts or aborts, and answer questions. See `src/core/types.ts` for the exact
+shapes.
 
 ## Architecture
 
@@ -700,7 +798,7 @@ src/server/server.ts
 ```
 
 - `src/core/` holds shared types, config, URL canonicalization, events, and utilities.
-- `src/agent/` owns the streamed model/tool loop and run lifecycle. It publishes server
+- `src/agent/` owns the streamed model/tool loop and durable run lifecycle. It publishes server
   events and never knows whether the consumer is a browser or the terminal.
 - `src/providers/` adapts three wire protocols plus the optional local OpenCode runtime behind
   one `ProviderAdapter` interface.
@@ -733,11 +831,13 @@ Live smoke tests use real providers and search engines; they are not part of `bu
 
 ```sh
 bun scripts/smoke-agent.ts [provider/model] ["prompt"]
+bun scripts/smoke-runs.ts [provider/model]
 bun scripts/smoke-research.ts [provider/model] ["question"] [depth]
 ```
 
-`smoke-research.ts` writes its report under the configured data home. Both scripts use an
-in-memory database.
+`smoke-runs.ts` exercises a completed run, an aborted/resumed run, a restart recovery, and a
+budget stop against a real provider. `smoke-research.ts` writes its report under the
+configured data home. All three scripts use an in-memory or temporary database.
 
 The repository favors small, reviewable commits. The code is organized so the agent loop,
 research pipeline, crawler, storage, browser, and CLI can be read independently.
