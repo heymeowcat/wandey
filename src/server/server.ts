@@ -39,7 +39,7 @@ export interface ServerOptions {
 export interface WandeyServer {
   url: string;
   port: number;
-  stop(): void;
+  stop(): Promise<void>;
   store: Store;
   agent: Agent;
   bus: EventBus;
@@ -67,6 +67,16 @@ export async function startServer(options: ServerOptions): Promise<WandeyServer>
   fs.mkdirSync(paths.cacheDir, { recursive: true });
 
   const store = new Store(paths.dbFile);
+  // Nothing can still be running in a fresh process. Recovery runs before the
+  // Agent exists so a run cannot claim a stale row.
+  const interruptedRuns = store.recoverInterruptedRuns();
+  if (interruptedRuns > 0) {
+    console.error(`[runs] marked ${interruptedRuns} interrupted run(s) resumable`);
+  }
+  const expiredQuestions = store.expirePendingQuestions();
+  if (expiredQuestions > 0) {
+    console.error(`[agent] expired ${expiredQuestions} unanswered question(s)`);
+  }
   const recovered = store.recoverInterruptedResearchJobs();
   if (recovered > 0) {
     console.error(`[research] marked ${recovered} interrupted job(s) resumable`);
@@ -364,7 +374,11 @@ export async function startServer(options: ServerOptions): Promise<WandeyServer>
 
           if (!rest && req.method === "GET") {
             const detail = store.getSessionDetail(sessionID);
-            return json({ ...detail, running: agent.isRunning(sessionID) });
+            return json({
+              ...detail,
+              running: agent.isRunning(sessionID),
+              runs: store.listRuns(sessionID, { limit: 20, includeDismissed: true }),
+            });
           }
 
           if (!rest && req.method === "PATCH") {
@@ -416,14 +430,51 @@ export async function startServer(options: ServerOptions): Promise<WandeyServer>
           return json({ error: "Not found" }, 404);
         }
 
+        const runMatch = pathname.match(/^\/api\/runs\/([^/]+)(?:\/(.+))?$/);
+        if (runMatch) {
+          const runID = decodeURIComponent(runMatch[1]!);
+          const rest = runMatch[2] ?? "";
+          const run = store.getRun(runID);
+          if (!run) return json({ error: "Run not found" }, 404);
+
+          if (!rest && req.method === "GET") {
+            return json({
+              run,
+              steps: store.listRunSteps(runID),
+              checkpoints: store.listRunCheckpoints(runID),
+            });
+          }
+
+          if (rest === "resume" && req.method === "POST") {
+            try {
+              const resumed = await agent.resumeRun(runID);
+              return json({ run: resumed }, 202);
+            } catch (err) {
+              return json({ error: (err as Error).message }, 409);
+            }
+          }
+
+          if (rest === "dismiss" && req.method === "POST") {
+            if (run.status === "running" || run.status === "waiting") {
+              return json({ error: "Stop the run before dismissing it." }, 409);
+            }
+            const dismissed = store.dismissRun(runID);
+            if (!dismissed) return json({ error: "Run not found" }, 404);
+            bus.publish({ type: "run.updated", sessionID: dismissed.sessionID, run: dismissed });
+            return json({ run: dismissed });
+          }
+
+          return json({ error: "Not found" }, 404);
+        }
+
         const resumeMatch = pathname.match(/^\/api\/research\/([^/]+)\/resume$/);
         if (resumeMatch && req.method === "POST") {
           const jobID = decodeURIComponent(resumeMatch[1]!);
           const job = store.getResearchJob(jobID);
           if (!job) return json({ error: "Research job not found" }, 404);
           try {
-            const message = await agent.resumeResearch(jobID);
-            return json({ message }, 202);
+            const resumed = await agent.resumeResearch(jobID);
+            return json(resumed, 202);
           } catch (err) {
             return json({ error: (err as Error).message }, 409);
           }
@@ -530,12 +581,20 @@ export async function startServer(options: ServerOptions): Promise<WandeyServer>
     agent,
     bus,
     registry,
-    stop() {
-      agent.abortAll();
-      registry.stop();
-      store.recoverInterruptedResearchJobs("Interrupted by a server shutdown. Resume it to continue.");
-      server.stop(true);
-      store.close();
+    async stop() {
+      try {
+        // Give active runs a chance to persist their terminal state instead of
+        // closing SQLite underneath a streaming write. Anything still running
+        // after the drain is recovered below.
+        await agent.drain(2_000);
+      } finally {
+        store.recoverInterruptedRuns("Interrupted by a server shutdown. Resume it to continue.");
+        store.expirePendingQuestions();
+        store.recoverInterruptedResearchJobs("Interrupted by a server shutdown. Resume it to continue.");
+        registry.stop();
+        await server.stop(true);
+        store.close();
+      }
     },
   };
 }

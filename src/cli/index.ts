@@ -165,8 +165,7 @@ async function serve(argv: string[]): Promise<void> {
 
   const stop = (): void => {
     console.log(`\n${dim("stopping…")}`);
-    server.stop();
-    process.exit(0);
+    void server.stop().then(() => process.exit(0));
   };
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
@@ -201,6 +200,11 @@ async function chat(argv: string[]): Promise<void> {
   ensurePaths(paths);
 
   const store = new Store(paths.dbFile);
+  // A previous process may have exited mid-run. Recover before the Agent can
+  // accept prompts so stale running rows are resumable instead of stuck.
+  const interruptedRuns = store.recoverInterruptedRuns();
+  if (interruptedRuns > 0) console.log(dim(`recovered ${interruptedRuns} interrupted run(s)`));
+  store.expirePendingQuestions();
   const registry = new ProviderRegistry(config);
   const bus = new EventBus();
   const fetcher = new PageFetcher(config.crawl);
@@ -561,8 +565,10 @@ async function chat(argv: string[]): Promise<void> {
     });
     activeRun = true;
     lastResearchKey = "";
+    let runID: string | null = null;
     try {
-      await agent.prompt(session.id, input, { model, mode });
+      const result = await agent.prompt(session.id, input, { model, mode });
+      runID = result.run.id;
       if (agent.isRunning(session.id)) await done;
     } catch (err) {
       newline();
@@ -572,6 +578,7 @@ async function chat(argv: string[]): Promise<void> {
       resolveIdle = null;
       newline();
       printRunSummary();
+      if (runID) console.log(dim(`  run ${runID}`));
     }
   }
 

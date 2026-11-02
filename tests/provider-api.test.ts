@@ -24,7 +24,7 @@ async function withServer(fn: (server: WandeyServer, paths: Paths) => Promise<vo
   try {
     await fn(server, paths);
   } finally {
-    server.stop();
+    await server.stop();
   }
 }
 

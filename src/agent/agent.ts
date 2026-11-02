@@ -99,6 +99,35 @@ export class Agent {
     return [...this.runs.keys()];
   }
 
+  /** Number of runs currently executing in this process. */
+  activeRunCount(): number {
+    return this.runs.size;
+  }
+
+  /**
+   * Abort active runs and wait for their finalizers, bounded by `timeoutMs`.
+   * The server uses this to persist an orderly shutdown instead of closing the
+   * database under a streaming run.
+   */
+  async drain(timeoutMs = 2_000): Promise<void> {
+    const promises = [...this.runs.values()].map((run) => run.promise);
+    this.abortAll();
+    if (promises.length === 0) return;
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        Promise.allSettled(promises),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, Math.max(0, timeoutMs));
+          (timer as { unref?: () => void }).unref?.();
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
   /**
    * Persist the user's prompt and start the loop in the background. Returns the
    * user message and run immediately so the HTTP layer can acknowledge them.
@@ -283,11 +312,23 @@ export class Agent {
    * owns its conversation, sources, and notes; this only creates a fresh
    * assistant message so the resumed research card is visible in the timeline.
    */
-  async resumeResearch(jobID: string): Promise<Message> {
+  async resumeResearch(jobID: string): Promise<{ message: Message | null; run: Run | null }> {
     const { store, bus, config } = this.deps;
     const job = store.getResearchJob(jobID);
     if (!job) throw new Error(`Research job ${jobID} not found`);
     if (job.status === "done") throw new Error("This research job is already complete.");
+
+    // New runs link the research job to the tool step that started it. Resume
+    // the run so the checkpoint, budget, and trace stay in one place.
+    const linkedStep = store.findRunStepByRef(jobID);
+    if (linkedStep) {
+      const run = await this.resumeRun(linkedStep.runID);
+      return {
+        message: run.assistantMessageID ? store.getMessage(run.assistantMessageID) : null,
+        run,
+      };
+    }
+
     if (this.runs.has(job.sessionID) || store.activeRun(job.sessionID)) {
       throw new Error("This session is already running. Wait for it to finish or stop it first.");
     }
@@ -317,7 +358,7 @@ export class Agent {
         const latest = store.getSession(job.sessionID);
         if (latest) bus.publish({ type: "session.updated", session: latest });
       });
-    return assistant;
+    return { message: assistant, run: null };
   }
 
   private async runResearchResume(
