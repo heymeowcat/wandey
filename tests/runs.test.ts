@@ -622,6 +622,130 @@ describe("Agent run resume", () => {
   });
 });
 
+describe("Agent retry and fallback", () => {
+  test("retries a transient failure before any content", async () => {
+    const h = setup(
+      (_ref, _request, call) => {
+        if (call === 1) throw Object.assign(new Error("provider: HTTP 429"), { status: 429 });
+        return textResponse("recovered", { input: 3, output: 2, total: 5 });
+      },
+      {
+        config: (config) => {
+          config.agent.retry.attempts = 2;
+          config.agent.retry.baseDelayMs = 0;
+        },
+      },
+    );
+
+    const { run } = await h.agent.prompt(h.sessionID, "Hi");
+    const done = await waitForRun(h.store, run.id);
+
+    expect(done.status).toBe("completed");
+    expect(done.usage.totalTokens).toBe(5);
+    const steps = h.store.listRunSteps(run.id).filter((step) => step.kind === "model");
+    expect(steps.map((step) => step.attempt)).toEqual([1, 2]);
+    expect(steps[0]!.status).toBe("failed");
+    expect(steps[1]!.status).toBe("completed");
+    const assistant = h.store
+      .getSessionDetail(h.sessionID)!
+      .messages.find((entry) => entry.message.role === "assistant")!;
+    const texts = assistant.parts.filter((part) => part.type === "text");
+    expect(texts).toHaveLength(1);
+    if (texts[0]?.type === "text") expect(texts[0].data.text).toBe("recovered");
+  });
+
+  test("falls back to the next model after the primary is exhausted", async () => {
+    const h = setup(
+      (ref) => {
+        if (ref === "fake/model") {
+          throw Object.assign(new Error("provider: HTTP 503"), { status: 503 });
+        }
+        return textResponse("backup answer", { input: 4, output: 2, total: 6 });
+      },
+      {
+        models: { "fake/model": {}, "fake/backup": {} },
+        config: (config) => {
+          config.agent.retry.attempts = 2;
+          config.agent.retry.baseDelayMs = 0;
+          config.agent.fallback = ["fake/backup"];
+        },
+      },
+    );
+
+    const { run } = await h.agent.prompt(h.sessionID, "Hi");
+    const done = await waitForRun(h.store, run.id);
+
+    expect(done.status).toBe("completed");
+    expect(done.usage.totalTokens).toBe(6);
+    const steps = h.store.listRunSteps(run.id).filter((step) => step.kind === "model");
+    expect(steps.map((step) => step.model)).toEqual(["fake/model", "fake/model", "fake/backup"]);
+    expect(steps.map((step) => step.attempt)).toEqual([1, 2, 3]);
+    const assistant = h.store
+      .getSessionDetail(h.sessionID)!
+      .messages.find((entry) => entry.message.role === "assistant")!;
+    expect(assistant.message.model).toBe("fake/backup");
+  });
+
+  test("does not retry or fall back after content has streamed", async () => {
+    const h = setup(
+      async function* (ref) {
+        if (ref === "fake/model") {
+          yield { type: "text", delta: "partial" };
+          throw Object.assign(new Error("provider: HTTP 500"), { status: 500 });
+        }
+        yield { type: "text", delta: "backup" };
+        yield { type: "finish", reason: "stop" as const };
+      },
+      {
+        models: { "fake/model": {}, "fake/backup": {} },
+        config: (config) => {
+          config.agent.retry.attempts = 3;
+          config.agent.retry.baseDelayMs = 0;
+          config.agent.fallback = ["fake/backup"];
+        },
+      },
+    );
+
+    const { run } = await h.agent.prompt(h.sessionID, "Hi");
+    const done = await waitForRun(h.store, run.id);
+
+    expect(done.status).toBe("interrupted");
+    expect(done.stopReason).toBe("error");
+    expect(h.registry.calls.filter((call) => call.ref === "fake/model")).toHaveLength(1);
+    expect(h.registry.calls.some((call) => call.ref === "fake/backup")).toBe(false);
+    const steps = h.store.listRunSteps(run.id).filter((step) => step.kind === "model");
+    expect(steps).toHaveLength(1);
+    expect(steps[0]!.status).toBe("failed");
+  });
+
+  test("runs a text-only fallback without tool schemas", async () => {
+    const toolsSeen: number[] = [];
+    const h = setup(
+      (ref, request) => {
+        if (ref === "fake/model") {
+          throw Object.assign(new Error("provider: HTTP 429"), { status: 429 });
+        }
+        toolsSeen.push(request.tools?.length ?? 0);
+        return textResponse("text only");
+      },
+      {
+        models: { "fake/model": {}, "fake/backup": { supportsTools: false } },
+        config: (config) => {
+          config.agent.retry.attempts = 1;
+          config.agent.retry.baseDelayMs = 0;
+          config.agent.fallback = ["fake/backup"];
+        },
+      },
+    );
+
+    const { run } = await h.agent.prompt(h.sessionID, "Hi");
+    const done = await waitForRun(h.store, run.id);
+
+    expect(done.status).toBe("completed");
+    expect(toolsSeen).toEqual([0]);
+  });
+});
+
 describe("Agent run budgets", () => {
   test("stops a run when the token budget is exceeded", async () => {
     const h = setup(() => textResponse("hello", { input: 6, output: 4, total: 10 }), {

@@ -318,9 +318,21 @@ class ResearchRun {
     this.signal = input.signal;
     this.model = model;
     this.observer = input.observer;
-    this.planModel = new ResearchModel(deps.registry, deps.config.research.planModel.trim() || model);
-    this.workerModel = new ResearchModel(deps.registry, deps.config.research.workerModel.trim() || model);
-    this.synthModel = new ResearchModel(deps.registry, deps.config.research.synthModel.trim() || model);
+    this.planModel = new ResearchModel(
+      deps.registry,
+      deps.config.research.planModel.trim() || model,
+      researchRetry(deps.config),
+    );
+    this.workerModel = new ResearchModel(
+      deps.registry,
+      deps.config.research.workerModel.trim() || model,
+      researchRetry(deps.config),
+    );
+    this.synthModel = new ResearchModel(
+      deps.registry,
+      deps.config.research.synthModel.trim() || model,
+      researchRetry(deps.config),
+    );
   }
 
   async execute(resume = false): Promise<ResearchOutcome> {
@@ -616,8 +628,8 @@ class ResearchRun {
         prompt,
         temperature: 0.2,
         signal: this.signal,
-        onAttempt: this.attemptReporter(this.planModel),
-        onUsage: this.usageReporter(this.planModel),
+        onAttempt: this.attemptReporter(),
+        onUsage: this.usageReporter(),
       });
     } catch (err) {
       this.throwIfAborted(err);
@@ -817,8 +829,8 @@ class ResearchRun {
             prompt,
             temperature: 0.1,
             signal: this.signal,
-            onAttempt: this.attemptReporter(this.workerModel),
-            onUsage: this.usageReporter(this.workerModel),
+            onAttempt: this.attemptReporter(),
+            onUsage: this.usageReporter(),
           });
         } catch (err) {
           this.throwIfAborted(err);
@@ -879,8 +891,8 @@ class ResearchRun {
         prompt,
         temperature: 0.3,
         signal: this.signal,
-        onAttempt: this.attemptReporter(this.planModel),
-        onUsage: this.usageReporter(this.planModel),
+        onAttempt: this.attemptReporter(),
+        onUsage: this.usageReporter(),
       });
       this.throwIfAborted();
       const followUps = normalizeSubQuestions(
@@ -926,8 +938,8 @@ class ResearchRun {
         prompt,
         temperature: 0.35,
         signal: this.signal,
-        onAttempt: this.attemptReporter(this.synthModel),
-        onUsage: this.usageReporter(this.synthModel),
+        onAttempt: this.attemptReporter(),
+        onUsage: this.usageReporter(),
       });
     } catch (err) {
       this.throwIfAborted(err);
@@ -1058,12 +1070,12 @@ class ResearchRun {
     if (err && (err as Error)?.name === "AbortError") throw err;
   }
 
-  private attemptReporter(model: ResearchModel): () => void {
-    return () => this.observer?.onModelAttempt?.(model.ref);
+  private attemptReporter(): (model: string, attempt: number) => void {
+    return (model) => this.observer?.onModelAttempt?.(model);
   }
 
-  private usageReporter(model: ResearchModel): (usage: Usage, estimated: boolean) => void {
-    return (usage, estimated) => this.observer?.onModelUsage?.(model.ref, usage, estimated);
+  private usageReporter(): (model: string, usage: Usage, estimated: boolean) => void {
+    return (model, usage, estimated) => this.observer?.onModelUsage?.(model, usage, estimated);
   }
 
 }
@@ -1071,6 +1083,18 @@ class ResearchRun {
 // ---------------------------------------------------------------------------
 // Pure helpers
 // ---------------------------------------------------------------------------
+
+function researchRetry(config: Config): {
+  attempts: number;
+  baseDelayMs: number;
+  fallback: string[];
+} {
+  return {
+    attempts: config.agent.retry.attempts,
+    baseDelayMs: config.agent.retry.baseDelayMs,
+    fallback: config.agent.fallback,
+  };
+}
 
 function settingsFor(config: Config, depth: ResearchDepth): Settings {
   const scale = DEPTH_SCALE[depth];

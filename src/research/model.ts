@@ -1,6 +1,7 @@
 import type { ChatMessage, Usage } from "../core/types.ts";
 import { estimateTokens } from "../core/run-usage.ts";
-import { extractJson, retry } from "../core/util.ts";
+import { extractJson } from "../core/util.ts";
+import { streamWithFallback } from "../providers/retry.ts";
 import type { ProviderRegistry } from "../providers/registry.ts";
 
 /**
@@ -18,19 +19,37 @@ export interface CompletionRequest {
   temperature?: number;
   maxTokens?: number;
   signal?: AbortSignal;
-  /** Called at the start of every retry attempt, so budgets can reset deltas. */
-  onAttempt?: () => void;
-  /** Receives provider usage, or an estimate when the provider reports none. */
-  onUsage?: (usage: Usage, estimated: boolean) => void;
+  /** Called at the start of every attempt, so budgets can reset deltas. */
+  onAttempt?: (model: string, attempt: number) => void;
+  /** Receives usage for every attempt, including failed ones. */
+  onUsage?: (model: string, usage: Usage, estimated: boolean) => void;
+}
+
+export interface ResearchModelOptions {
+  attempts: number;
+  baseDelayMs: number;
+  /** Ordered fallbacks, tried after the primary is exhausted. */
+  fallback: string[];
+}
+
+export interface CompletionResult {
+  text: string;
+  usage: Usage;
+  model: string;
 }
 
 export class ResearchModel {
   constructor(
     private readonly registry: ProviderRegistry,
     readonly ref: string,
+    private readonly options: ResearchModelOptions = {
+      attempts: 3,
+      baseDelayMs: 700,
+      fallback: [],
+    },
   ) {}
 
-  async text(request: CompletionRequest): Promise<string> {
+  async complete(request: CompletionRequest): Promise<CompletionResult> {
     if (!this.ref.trim()) throw new Error("No model is available for research");
 
     const messages: ChatMessage[] =
@@ -40,47 +59,62 @@ export class ResearchModel {
         : []);
     if (messages.length === 0) throw new Error("Research model call had no input");
 
-    return retry(
-      async () => {
-        request.onAttempt?.();
-        let output = "";
-        let finishError: string | undefined;
-        const usage: Usage = {};
-        let reportedUsage = false;
-        const report = () => {
-          if (reportedUsage) {
-            request.onUsage?.(usage, false);
-            return;
-          }
-          const input = estimateTokens(request.system?.length ?? 0) + estimateTokens(messageChars(messages));
-          const outputTokens = estimateTokens(output.length);
-          request.onUsage?.({ input, output: outputTokens, total: input + outputTokens }, true);
-        };
-        try {
-          for await (const event of this.registry.stream(this.ref, {
+    const inputChars = (request.system?.length ?? 0) + messageChars(messages);
+    // A completely empty completion is retryable once. This is separate from
+    // provider failures, which the shared helper already retries.
+    for (let emptyAttempt = 0; emptyAttempt < 2; emptyAttempt++) {
+      let text = "";
+      let usage: Usage = {};
+      let model = this.ref;
+
+      for await (const event of streamWithFallback({
+        candidates: [this.ref, ...this.options.fallback],
+        attempts: this.options.attempts,
+        baseDelayMs: this.options.baseDelayMs,
+        signal: request.signal,
+        supportsTools: async () => false,
+        open: (ref) =>
+          this.registry.stream(ref, {
             system: request.system,
             messages,
             temperature: request.temperature ?? 0.2,
             maxTokens: request.maxTokens,
             signal: request.signal,
-          })) {
-            if (event.type === "text") output += event.delta;
-            else if (event.type === "usage") {
-              reportedUsage = true;
-              mergeUsage(usage, event.usage);
-            } else if (event.type === "finish" && event.error) finishError = event.error;
+          }),
+        onAttempt: (info) => request.onAttempt?.(info.ref, info.attempt),
+        onAttemptEnd: (info) => {
+          const reported = info.usage;
+          if (reported) {
+            request.onUsage?.(info.ref, reported, false);
+            return;
           }
-        } catch (err) {
-          report();
-          throw err;
-        }
-        report();
-        if (finishError) throw new Error(finishError);
-        if (!output.trim()) throw new Error("The model returned an empty response");
-        return output;
-      },
-      { attempts: 3, baseDelayMs: 700, signal: request.signal },
-    );
+          // A rejected request with no output may not have consumed tokens;
+          // only estimate successes and partial attempts.
+          if (info.error && info.outputChars === 0) return;
+          const input = estimateTokens(inputChars);
+          const output = estimateTokens(info.outputChars);
+          request.onUsage?.(
+            info.ref,
+            { input, output, total: input + output },
+            true,
+          );
+        },
+      })) {
+        model = event.model;
+        if (event.type === "text") text += event.delta;
+        else if (event.type === "usage") mergeUsage(usage, event.usage);
+      }
+
+      if (text.trim()) return { text, usage, model };
+      // The helper already retried provider failures. Retry an empty response
+      // once, then surface the same error callers handled before.
+    }
+
+    throw new Error("The model returned an empty response");
+  }
+
+  async text(request: CompletionRequest): Promise<string> {
+    return (await this.complete(request)).text;
   }
 
   /** Ask for JSON and tolerate prose/code fences around the object. */

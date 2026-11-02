@@ -33,6 +33,7 @@ import { ResearchEngine, type ResearchObserver } from "../research/engine.ts";
 import { buildProviderHistory } from "./history.ts";
 import { buildSystemPrompt } from "./prompt.ts";
 import { BudgetExceededError, RunBudgetController, usageCost } from "./budget.ts";
+import { streamWithFallback } from "../providers/retry.ts";
 
 /**
  * The agent loop.
@@ -408,9 +409,16 @@ export class Agent {
       const canUseTools = await registry.supportsTools(model);
       // Prefer the cached catalog; only probe providers when a cost budget
       // actually needs pricing data.
-      const modelInfo =
-        registry.modelInfoSync(model) ??
-        (run.budget.maxCostUsd > 0 ? await registry.modelInfo(model) : null);
+      const candidateRefs = [...new Set([model, ...config.agent.fallback].filter(Boolean))];
+      const modelInfos = new Map<string, ModelInfo | null>();
+      for (const ref of candidateRefs) {
+        modelInfos.set(
+          ref,
+          registry.modelInfoSync(ref) ??
+            (run.budget.maxCostUsd > 0 ? await registry.modelInfo(ref) : null),
+        );
+      }
+      const toolSupport = new Map<string, boolean>([[model, canUseTools]]);
       const budget = new RunBudgetController({
         budget: run.budget,
         usage: store.sumRunUsage(runID),
@@ -494,10 +502,9 @@ export class Agent {
         }
 
         budget.checkModel();
-        budget.beginModelAttempt();
 
         const history = buildProviderHistory(store, sessionID, config.agent.contextChars);
-        const system = buildSystemPrompt({
+        let system = buildSystemPrompt({
           config,
           session: store.getSession(sessionID) ?? session,
           tools,
@@ -516,7 +523,8 @@ export class Agent {
         bus.publish({ type: "session.status", sessionID, status: "streaming" });
 
         const stepKey = `model:${state.loopStep}`;
-        const modelStep = store.createRunStep({
+        let currentModel = model;
+        let currentStep = store.createRunStep({
           runID,
           stepKey,
           kind: "model",
@@ -530,7 +538,7 @@ export class Agent {
             tools: canUseTools ? tools.names() : [],
           }),
         });
-        this.publishRunStep(sessionID, modelStep);
+        this.publishRunStep(sessionID, currentStep);
 
         // Save the cursor before streaming so a crash always has a message and
         // step to clean up instead of a half-written conversation.
@@ -539,7 +547,7 @@ export class Agent {
           loopStep: state.loopStep,
           phase: "model",
           assistantMessageID: assistant.id,
-          modelStepID: modelStep.id,
+          modelStepID: currentStep.id,
           toolCalls: [],
           nextToolIndex: 0,
         };
@@ -553,10 +561,13 @@ export class Agent {
         let reasoningPartData = { text: "" };
         let lastPersist = Date.now();
         const calls: ToolCallBlock[] = [];
-        const usage: Usage = {};
-        let sawUsage = false;
         let finishReason: FinishReason = "stop";
         let streamError: string | null = null;
+        let currentStepEnded = false;
+        let currentStepUsage: RunStepUsage | null = null;
+        let usageTotals: Usage = {};
+
+        const inputChars = () => system.length + historyChars(history.messages);
 
         const persistStreaming = (force = false) => {
           if (!force && Date.now() - lastPersist < 800) return;
@@ -584,12 +595,109 @@ export class Agent {
         };
 
         try {
-          for await (const event of registry.stream(model, {
-            system,
-            messages: history.messages,
-            tools: canUseTools ? tools.schemas() : [],
-            temperature: config.agent.temperature,
+          for await (const event of streamWithFallback({
+            candidates: candidateRefs,
+            attempts: config.agent.retry.attempts,
+            baseDelayMs: config.agent.retry.baseDelayMs,
+            startAttempt: currentStep.attempt - 1,
             signal: controller.signal,
+            supportsTools: async (ref) => {
+              const cached = toolSupport.get(ref);
+              if (cached !== undefined) return cached;
+              const supported = await registry.supportsTools(ref);
+              toolSupport.set(ref, supported);
+              return supported;
+            },
+            open: (ref, toolsEnabled) =>
+              registry.stream(ref, {
+                system,
+                messages: history.messages,
+                tools: toolsEnabled ? tools.schemas() : [],
+                temperature: config.agent.temperature,
+                signal: controller.signal,
+              }),
+            onAttempt: ({ ref, attempt, toolsEnabled }) => {
+              budget.checkModel();
+              budget.beginModelAttempt();
+              currentModel = ref;
+              system = buildSystemPrompt({
+                config,
+                session: store.getSession(sessionID) ?? session,
+                tools,
+                toolsEnabled,
+                trimmedNote: history.note,
+                model: ref,
+              });
+              const trace = traceInput({
+                systemChars: system.length,
+                messages: history.messages.length,
+                tools: toolsEnabled ? tools.names() : [],
+              });
+
+              if (currentStepEnded) {
+                currentStep = store.createRunStep({
+                  runID,
+                  stepKey,
+                  kind: "model",
+                  name: "model",
+                  attempt,
+                  model: ref,
+                  messageID: assistant.id,
+                  input: trace,
+                });
+                this.publishRunStep(sessionID, currentStep);
+                state = { ...state, assistantMessageID: assistant.id, modelStepID: currentStep.id };
+                store.createRunCheckpoint(runID, state);
+              } else {
+                const updated = store.updateRunStep(currentStep.id, { model: ref, input: trace });
+                if (updated) {
+                  currentStep = updated;
+                }
+              }
+              currentStepEnded = false;
+              currentStepUsage = null;
+            },
+            onAttemptEnd: ({ ref, usage, outputChars, error }) => {
+              const info = modelInfos.get(ref) ?? null;
+              // A rejected request that emitted no content did not necessarily
+              // consume tokens. Estimate only successes and partial attempts.
+              let stepUsage: RunStepUsage | null;
+              if (usage) {
+                stepUsage = this.stepUsage(usage, 0, 0);
+              } else if (outputChars > 0 || !error) {
+                const chars = inputChars();
+                stepUsage = this.stepUsage({}, chars, outputChars);
+                try {
+                  budget.addEstimatedUsage(chars, outputChars, info);
+                } catch (err) {
+                  if (!(err instanceof BudgetExceededError)) throw err;
+                }
+              } else {
+                stepUsage = null;
+              }
+              currentStepUsage = stepUsage;
+              if (stepUsage) usageTotals = addUsageTotals(usageTotals, stepUsage);
+
+              if (error) {
+                const budgetFailure = (error as Error)?.name === "BudgetExceededError";
+                this.finishStep(currentStep, sessionID, {
+                  status: budgetFailure || controller.signal.aborted ? "aborted" : "failed",
+                  error: (error as Error).message,
+                  output: truncate(text, TRACE_OUTPUT_CHARS),
+                  usage: stepUsage ?? undefined,
+                  endedAt: now(),
+                });
+                currentStepEnded = true;
+              } else {
+                const updated = store.updateRunStep(currentStep.id, {
+                  output: truncate(text, TRACE_OUTPUT_CHARS),
+                  usage: stepUsage,
+                });
+                if (updated) {
+                  currentStep = updated;
+                }
+              }
+            },
           })) {
             this.consumeEvent(event, {
               onText: (delta) => {
@@ -609,9 +717,7 @@ export class Agent {
               },
               onToolCall: (call) => calls.push(call),
               onUsage: (value) => {
-                sawUsage = true;
-                mergeUsage(usage, value);
-                budget.addUsage(model, value, modelInfo);
+                budget.addUsage(event.model, value, modelInfos.get(event.model) ?? null);
               },
               onFinish: (reason, error) => {
                 finishReason = reason;
@@ -644,54 +750,41 @@ export class Agent {
         if (streamError) finishReason = "error";
         else if (calls.length > 0) finishReason = "tool_calls";
 
-        const hasUsage = Object.values(usage).some((value) => value !== undefined);
+        const hasUsage = Object.values(usageTotals).some((value) => value !== undefined);
         const savedMessage = store.updateMessage(assistant.id, {
+          model: currentModel,
           finishReason,
-          usage: hasUsage ? usage : null,
+          usage: hasUsage ? usageTotals : null,
           error: streamError,
         });
         if (savedMessage) bus.publish({ type: "message.updated", sessionID, message: savedMessage });
 
-        const stepUsage = this.stepUsage(
-          usage,
-          system.length + historyChars(history.messages),
-          text.length + reasoning.length,
-        );
+        const stepUsage = currentStepUsage;
         const traceOutput = truncate(text, TRACE_OUTPUT_CHARS);
 
-        // Providers sometimes omit usage entirely. Estimate from the prompt and
-        // output so the budget still sees the spend.
-        if (!sawUsage) {
-          try {
-            budget.addEstimatedUsage(
-              system.length + historyChars(history.messages),
-              text.length + reasoning.length,
-              modelInfo,
-            );
-          } catch (err) {
-            if (!(err instanceof BudgetExceededError)) throw err;
-          }
-        }
-
         if (budgetError) {
-          this.finishStep(modelStep, sessionID, {
-            status: "aborted",
-            error: budgetError.message,
-            output: traceOutput,
-            usage: stepUsage,
-            endedAt: now(),
-          });
+          if (!currentStepEnded) {
+            this.finishStep(currentStep, sessionID, {
+              status: "aborted",
+              error: budgetError.message,
+              output: traceOutput,
+              usage: stepUsage,
+              endedAt: now(),
+            });
+          }
           terminal = this.budgetTerminal(sessionID, assistant.id, budgetError);
           break;
         }
         if (streamError) {
-          this.finishStep(modelStep, sessionID, {
-            status: "failed",
-            error: streamError,
-            output: traceOutput,
-            usage: stepUsage,
-            endedAt: now(),
-          });
+          if (!currentStepEnded) {
+            this.finishStep(currentStep, sessionID, {
+              status: "failed",
+              error: streamError,
+              output: traceOutput,
+              usage: stepUsage,
+              endedAt: now(),
+            });
+          }
           this.addErrorPart(sessionID, assistant.id, streamError);
           bus.publish({ type: "session.error", sessionID, message: streamError });
           // A mid-stream failure is resumable. Resume deletes this partial
@@ -700,26 +793,30 @@ export class Agent {
           break;
         }
         if (controller.signal.aborted) {
-          this.finishStep(modelStep, sessionID, {
-            status: "aborted",
-            error: "Stopped by user.",
-            output: traceOutput,
-            usage: stepUsage,
-            endedAt: now(),
-          });
+          if (!currentStepEnded) {
+            this.finishStep(currentStep, sessionID, {
+              status: "aborted",
+              error: "Stopped by user.",
+              output: traceOutput,
+              usage: stepUsage,
+              endedAt: now(),
+            });
+          }
           if (!textPart && calls.length === 0) this.addErrorPart(sessionID, assistant.id, "Stopped by user.");
           terminal = { status: "aborted", stopReason: "user", error: null };
           break;
         }
         if (!text.trim() && reasoning.trim() && calls.length === 0) {
           const message = "The model ended without producing an answer.";
-          this.finishStep(modelStep, sessionID, {
-            status: "failed",
-            error: message,
-            output: truncate(reasoning, TRACE_OUTPUT_CHARS),
-            usage: stepUsage,
-            endedAt: now(),
-          });
+          if (!currentStepEnded) {
+            this.finishStep(currentStep, sessionID, {
+              status: "failed",
+              error: message,
+              output: truncate(reasoning, TRACE_OUTPUT_CHARS),
+              usage: stepUsage,
+              endedAt: now(),
+            });
+          }
           this.addErrorPart(sessionID, assistant.id, message);
           terminal = { status: "failed", stopReason: "error", error: message };
           break;
@@ -728,13 +825,13 @@ export class Agent {
         // Persist the step's output and usage before advancing the checkpoint.
         // If the process dies between the two writes, resume can trust the
         // checkpoint and still keep the trace's token counts.
-        store.updateRunStep(modelStep.id, { output: traceOutput, usage: stepUsage });
+        store.updateRunStep(currentStep.id, { output: traceOutput, usage: stepUsage });
         this.syncRunUsage(runID, elapsed());
 
         if (calls.length === 0) {
           state = { ...state, phase: "done" };
           store.createRunCheckpoint(runID, state);
-          this.finishStep(modelStep, sessionID, { status: "completed", endedAt: now() });
+          this.finishStep(currentStep, sessionID, { status: "completed", endedAt: now() });
           finalised = true;
           break;
         }
@@ -746,7 +843,7 @@ export class Agent {
         }));
         state = { ...state, phase: "tools", toolCalls: normalizedCalls, nextToolIndex: 0 };
         store.createRunCheckpoint(runID, state);
-        this.finishStep(modelStep, sessionID, { status: "completed", endedAt: now() });
+        this.finishStep(currentStep, sessionID, { status: "completed", endedAt: now() });
         this.syncRunUsage(runID, elapsed());
       }
 
@@ -1332,14 +1429,14 @@ export class Agent {
   }
 }
 
-function mergeUsage(target: Usage, source: Usage): void {
-  for (const key of Object.keys(source) as Array<keyof Usage>) {
-    const value = source[key];
-    if (value !== undefined) target[key] = value;
+/** Sum usage across retries and fallback attempts. */
+function addUsageTotals(total: Usage, add: Usage): Usage {
+  const next: Usage = { ...total };
+  for (const key of ["input", "output", "reasoning", "cacheRead", "cacheWrite", "total", "cost"] as const) {
+    const value = add[key];
+    if (value !== undefined) next[key] = (next[key] ?? 0) + value;
   }
-  if (target.total === undefined && target.input !== undefined && target.output !== undefined) {
-    target.total = target.input + target.output;
-  }
+  return next;
 }
 
 function historyChars(messages: ChatMessage[]): number {
